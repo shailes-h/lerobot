@@ -78,10 +78,15 @@ def find_i2rt_script():
     try:
         import i2rt
 
-        i2rt_path = os.path.dirname(i2rt.__file__)
-        script_path = os.path.join(os.path.dirname(i2rt_path), "scripts", "minimum_gello.py")
-        if os.path.exists(script_path):
-            return script_path
+        i2rt_path = list(i2rt.__path__)[0]
+        # Editable installs (and repo checkouts imported as a namespace package) point
+        # __path__ at the `i2rt/i2rt` package dir, with `examples/` one level up. A
+        # standard (non-editable) install has __path__ pointing at the checkout root
+        # directly. Try both.
+        for candidate_root in (os.path.dirname(i2rt_path), i2rt_path):
+            script_path = os.path.join(candidate_root, "examples", "minimum_gello", "minimum_gello.py")
+            if os.path.exists(script_path):
+                return script_path
     except ImportError:
         raise RuntimeError(
             "Could not import i2rt. Please install it separately:\n"
