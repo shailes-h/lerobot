@@ -65,6 +65,7 @@ from typing import Any
 
 import draccus
 import grpc
+import numpy as np
 import torch
 
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig  # noqa: F401
@@ -137,11 +138,35 @@ class RobotClient:
             rename_map=dict(config.rename_map),
             policy_config_overrides=list(config.policy_config_overrides),
         )
-        self.channel = grpc.insecure_channel(
-            self.server_address, grpc_channel_options(initial_backoff=f"{config.environment_dt:.4f}s")
-        )
-        self.stub = services_pb2_grpc.AsyncInferenceStub(self.channel)
-        self.logger.info(f"Initializing client to connect to server at {self.server_address}")
+        # A `server_address` starting with http(s):// talks a plain HTTP/JSON
+        # `/act` endpoint (e.g. a MolmoAct2 sim_eval-style server behind an ngrok
+        # tunnel) instead of the regular gRPC AsyncInference service. In that mode
+        # the "server" already has its policy/checkpoint fixed server-side, so
+        # there's no gRPC channel/stub and no policy-instructions handshake.
+        self.is_http_transport = self.server_address.startswith(("http://", "https://"))
+        self.channel = None
+        self.stub = None
+        self._http_session = None
+
+        if self.is_http_transport:
+            try:
+                import json_numpy
+                import requests
+
+                json_numpy.patch()
+                self._http_session = requests.Session()
+            except ImportError as e:
+                raise ImportError(
+                    "HTTP server_address requires `requests` and `json-numpy`: "
+                    "pip install requests json-numpy"
+                ) from e
+            self.logger.info(f"Initializing HTTP client to connect to server at {self.server_address}")
+        else:
+            self.channel = grpc.insecure_channel(
+                self.server_address, grpc_channel_options(initial_backoff=f"{config.environment_dt:.4f}s")
+            )
+            self.stub = services_pb2_grpc.AsyncInferenceStub(self.channel)
+            self.logger.info(f"Initializing client to connect to server at {self.server_address}")
 
         self.shutdown_event = threading.Event()
 
@@ -289,6 +314,12 @@ class RobotClient:
 
     def start(self):
         """Start the robot client and connect to the policy server"""
+        if self.is_http_transport:
+            # No handshake for the HTTP transport: the server's policy/checkpoint
+            # is fixed server-side, there's nothing to negotiate.
+            self.shutdown_event.clear()
+            return True
+
         try:
             # client-server handshake
             start_time = time.perf_counter()
@@ -349,7 +380,8 @@ class RobotClient:
             self.logger.info("Robot disconnected")
 
             try:
-                self.channel.close()
+                if self.channel is not None:
+                    self.channel.close()
                 self.logger.info("Disconnected from policy server")
             except Exception as e:
                 self.logger.warning(f"Error closing policy server connection: {e}")
@@ -411,6 +443,9 @@ class RobotClient:
         if not isinstance(obs, TimedObservation):
             raise ValueError("Input observation needs to be a TimedObservation!")
 
+        if self.is_http_transport:
+            return self._http_infer(obs)
+
         start_time = time.perf_counter()
         observation_bytes = pickle.dumps(obs)
         serialize_time = time.perf_counter() - start_time
@@ -431,6 +466,105 @@ class RobotClient:
 
         except grpc.RpcError as e:
             self.logger.error(f"Error sending observation #{obs.get_timestep()}: {e}")
+            return False
+
+    def _build_http_state(self, raw_observation: dict[str, Any]) -> np.ndarray:
+        """Build the state vector for an HTTP `/act` request from a raw observation.
+
+        Normally just reads `self.robot.action_features` in order. Some i2rt arm
+        server configs don't report a separate `{side}_gripper.pos` (the server has
+        no gripper_index, even though num_dofs()==7 for a 6-joint+gripper arm), so
+        that key can be missing from the observation even though it's a valid
+        `send_action` target (bi_yam_follower.send_action looks it up by fixed
+        name regardless of what the observation reported). In that case we fall
+        back to the last joint's position as a best-effort gripper-state proxy —
+        this only degrades the policy's gripper-state *input*, not its ability to
+        command the gripper.
+        """
+        values = []
+        missing_keys = []
+        last_seen = 0.0
+        for key in self.robot.action_features:
+            if key in raw_observation:
+                last_seen = raw_observation[key]
+                values.append(last_seen)
+            else:
+                missing_keys.append(key)
+                values.append(last_seen)  # best-effort proxy, see docstring
+
+        if missing_keys and not getattr(self, "_warned_missing_http_state_keys", False):
+            self.logger.warning(
+                f"Observation missing keys {missing_keys} (arm server reports no separate "
+                "gripper reading) - using last available joint value as a proxy for the "
+                "policy's state input. Gripper commands are unaffected."
+            )
+            self._warned_missing_http_state_keys = True
+
+        return np.array(values, dtype=np.float32)
+
+    def _http_infer(self, obs: TimedObservation) -> bool:
+        """Query an HTTP `/act`-style policy server (e.g. MolmoAct2's sim_eval server)
+        and push the resulting action chunk into the action queue.
+
+        Unlike the gRPC transport, this endpoint answers observations synchronously
+        with the action chunk directly (no separate SendObservations/GetActions RPCs),
+        so both steps happen here instead of in `receive_actions`.
+
+        NOTE: assumes `self.robot.action_features` insertion order matches the
+        server's expected state/action vector order (true for bi_yam_follower:
+        left_joint_0..5, left_gripper, right_joint_0..5, right_gripper), and that
+        gripper values use the same [0, 1] (1=open) convention on both sides.
+        """
+        import json_numpy
+
+        raw_observation = obs.get_observation()
+        task = raw_observation.get("task", "")
+
+        try:
+            state = self._build_http_state(raw_observation)
+
+            payload: dict[str, Any] = {"instruction": task, "state": state}
+            for cam_key in self.robot.cameras:
+                payload[f"{cam_key}_cam"] = np.asarray(raw_observation[cam_key])
+
+            start_time = time.perf_counter()
+            resp = self._http_session.post(
+                self.server_address,
+                headers={"Content-Type": "application/json"},
+                data=json_numpy.dumps(payload),
+                timeout=30,
+            )
+            request_time = time.perf_counter() - start_time
+
+            if resp.status_code != 200:
+                raise RuntimeError(f"Server error {resp.status_code}: {resp.text[:500]}")
+
+            data = resp.json()
+            actions = np.asarray(data["actions"] if isinstance(data, dict) and "actions" in data else data)
+            if actions.ndim == 1:
+                actions = actions[None, :]
+
+            i_0 = obs.get_timestep()
+            timed_actions = [
+                TimedAction(
+                    timestamp=obs.get_timestamp() + i * self.config.environment_dt,
+                    timestep=i_0 + i,
+                    action=torch.as_tensor(action, dtype=torch.float32),
+                )
+                for i, action in enumerate(actions)
+            ]
+
+            self.action_chunk_size = max(self.action_chunk_size, len(timed_actions))
+            self._aggregate_action_queues(timed_actions, self.config.aggregate_fn)
+            self.must_go.set()
+
+            self.logger.debug(
+                f"[HTTP] Obs #{i_0} -> {len(timed_actions)} actions in {request_time:.3f}s"
+            )
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Error querying HTTP policy server for observation #{obs.get_timestep()}: {e}")
             return False
 
     def _inspect_action_queue(self):
@@ -490,6 +624,14 @@ class RobotClient:
         # Wait at barrier for synchronized start
         self.start_barrier.wait()
         self.logger.info("Action receiving thread starting")
+
+        if self.is_http_transport:
+            # HTTP transport answers observations with the action chunk directly
+            # (handled inline in `send_observation` -> `_http_infer`); this thread
+            # has nothing separate to poll, just idle until shutdown.
+            while self.running:
+                time.sleep(0.1)
+            return
 
         while self.running:
             try:
@@ -972,7 +1114,8 @@ class RobotClient:
                         self.robot.disconnect()
                         self.logger.info("Robot disconnected")
                         try:
-                            self.channel.close()
+                            if self.channel is not None:
+                                self.channel.close()
                             self.logger.info("Disconnected from policy server")
                         except Exception as e:
                             self.logger.warning(f"Error closing policy server connection: {e}")
