@@ -169,3 +169,55 @@ rs-enumerate-devices | grep -i "serial"
 - **Data recording is skipped** in this guide. To record eval rollouts, add the
   `--dataset.*` flags — see the example at the top of
   `src/lerobot/async_inference/robot_client.py`
+
+---
+
+## 3. Data Collection (Teleoperation)
+
+Unlike inference, this runs entirely on the client (Python 3.10 env from Step
+2) — no GPU server needed. The leader arms (YAM teaching handles) drive the
+followers locally while `lerobot-record` saves the episodes.
+
+### Step 3a — Start CAN + all 4 YAM servers (terminal 1)
+
+```bash
+bash i2rt/scripts/reset_all_can.sh
+
+# no --eval this time — also starts the leader (teaching handle) servers
+python -m lerobot.scripts.setup_bi_yam_servers
+```
+
+This launches follower servers on `1234`/`1235` (as before) plus leader
+servers on `5001` (right) and `5002` (left).
+
+### Step 3b — Record with `lerobot-record` (terminal 2)
+
+```bash
+lerobot-record \
+  --robot.type=bi_yam_follower \
+  --robot.left_arm_port 1235 \
+  --robot.right_arm_port 1234 \
+  --robot.cameras='{
+right: {"type": "intelrealsense", "serial_number_or_name": "260322275072", "width": 640, "height": 480, "fps": 30},
+left: {"type": "intelrealsense", "serial_number_or_name": "260322271881", "width": 640, "height": 480, "fps": 30},
+top: {"type": "intelrealsense", "serial_number_or_name": "262522074294", "width": 640, "height": 360, "fps": 30}
+}' \
+  --teleop.type=bi_yam_leader \
+  --teleop.left_arm_port 5002 \
+  --teleop.right_arm_port 5001 \
+  --dataset.repo_id=<hf_org>/<dataset_name> \
+  --dataset.num_episodes=10 \
+  --dataset.single_task="Pack everything into the box." \
+  --dataset.push_to_hub=false \
+  --display_data=true
+```
+
+The gripper is driven by the teaching handle's encoder knob (0 = closed,
+1 = open). Add `--robot.record_torques=true` to also save per-arm motor
+torques as `observation.{left,right}_torques`.
+
+This produces a LeRobot **v3.0** dataset — the format MolmoAct2's fine-tuning
+pipeline expects, so no conversion step is needed. To use it for fine-tuning,
+add its `repo_id` to `YAM_BIMANUAL_MOLMOACT2` in the molmoact2 repo's
+`experiments/launch_scripts/data_constants.py` and compute/register norm
+stats under the `yam_dual_molmoact2` tag.
