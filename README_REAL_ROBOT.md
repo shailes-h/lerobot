@@ -130,7 +130,7 @@ right: {"type": "intelrealsense", "serial_number_or_name": "260322275072", "widt
 left: {"type": "intelrealsense", "serial_number_or_name": "260322271881", "width": 640, "height": 480, "fps": 30},
 top: {"type": "intelrealsense", "serial_number_or_name": "262522074294", "width": 640, "height": 360, "fps": 30}
 }' \
-  --task "Pack everything into the box." \
+  --task "Put everything into the box." \
   --policy_type molmoact2 \
   --pretrained_name_or_path="" \
   --policy_device cuda \
@@ -205,12 +205,24 @@ top: {"type": "intelrealsense", "serial_number_or_name": "262522074294", "width"
   --teleop.type=bi_yam_leader \
   --teleop.left_arm_port 5002 \
   --teleop.right_arm_port 5001 \
-  --dataset.repo_id=<hf_org>/<dataset_name> \
-  --dataset.num_episodes=10 \
-  --dataset.single_task="Pack everything into the box." \
+  --dataset.repo_id=local/cubes \
+  --dataset.root=./datasets/cubesv3 \
+  --dataset.num_episodes=30 \
+  --dataset.episode_time_s=120 \
+  --dataset.reset_time_s=30 \
+  --dataset.video_encoding_batch_size=30 \
+  --dataset.single_task="Put all blocks into the box." \
   --dataset.push_to_hub=false \
-  --display_data=true
+  --display_data=false
 ```
+
+`--dataset.root` + `--dataset.push_to_hub=false` keeps everything local — no
+Hugging Face account/token needed; `repo_id` is just a local dataset name in
+that case, not a real HF namespace.
+
+`--display_data=false` disables the rerun visualization window — recording
+still runs fully over CLI, just without the live camera/state GUI, which
+removes that overhead.
 
 The gripper is driven by the teaching handle's encoder knob (0 = closed,
 1 = open). Add `--robot.record_torques=true` to also save per-arm motor
@@ -221,3 +233,9 @@ pipeline expects, so no conversion step is needed. To use it for fine-tuning,
 add its `repo_id` to `YAM_BIMANUAL_MOLMOACT2` in the molmoact2 repo's
 `experiments/launch_scripts/data_constants.py` and compute/register norm
 stats under the `yam_dual_molmoact2` tag.
+
+
+# SANITY CHECK CAMERA POSE:
+```bash
+python sanity_check_cameras.py
+```
