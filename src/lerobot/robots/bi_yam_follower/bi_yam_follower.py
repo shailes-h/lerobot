@@ -280,6 +280,13 @@ class BiYamFollower(Robot):
 
         if has_gripper:
             joint_pos = np.concatenate([joint_pos, arm_obs["gripper_pos"]])
+        else:
+            # Some follower servers (e.g. i2rt's minimum_gello.py) fold the gripper into
+            # a single flat `joint_pos` array instead of exposing a separate `gripper_pos`
+            # key. Fall back to the arm's known DOF count so the last element is still
+            # labeled `{side}_gripper.pos`, matching the schema built by `_build_per_arm_features`.
+            dofs = self._left_dofs if side == "left" else self._right_dofs
+            has_gripper = dofs == 7 and len(joint_pos) == 7
 
         for i, pos in enumerate(joint_pos):
             if has_gripper and i == len(joint_pos) - 1:
