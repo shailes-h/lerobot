@@ -213,7 +213,8 @@ top: {"type": "intelrealsense", "serial_number_or_name": "262522074294", "width"
   --dataset.video_encoding_batch_size=30 \
   --dataset.single_task="Put all blocks into the box." \
   --dataset.push_to_hub=false \
-  --display_data=false
+  --display_data=false  \
+  --robot.record_eef_pose=true
 ```
 
 `--dataset.root` + `--dataset.push_to_hub=false` keeps everything local — no
@@ -234,8 +235,23 @@ add its `repo_id` to `YAM_BIMANUAL_MOLMOACT2` in the molmoact2 repo's
 `experiments/launch_scripts/data_constants.py` and compute/register norm
 stats under the `yam_dual_molmoact2` tag.
 
+# SANITY REPLAY DATASET:
+```bash
+lerobot-replay-bi-yam --robot.left_arm_port=1235 --robot.right_arm_port=1234 \
+  --dataset.repo_id=local/sanity --dataset.root=./datasets/sanity --dataset.episode=0 \
+  --method=joint
+
+lerobot-replay-bi-yam --robot.left_arm_port=1235 --robot.right_arm_port=1234 \
+  --dataset.repo_id=local/sanity --dataset.root=./datasets/sanity --dataset.episode=0 \
+  --method=eef_absolute
+
+lerobot-replay-bi-yam --robot.left_arm_port=1235 --robot.right_arm_port=1234 \
+  --dataset.repo_id=local/sanity --dataset.root=./datasets/sanity --dataset.episode=0 \
+  --method=eef_delta
+```
 
 # SANITY CHECK CAMERA POSE:
 ```bash
 python sanity_check_cameras.py
 ```
+

@@ -26,6 +26,7 @@ from lerobot.cameras.utils import make_cameras_from_configs
 
 from ..robot import Robot
 from .config_bi_yam_follower import BiYamFollowerConfig
+from .eef_kinematics import EEF_POSE_NAMES_WITH_GRIPPER, eef_pose_from_joint_pos
 
 logger = logging.getLogger(__name__)
 
@@ -170,26 +171,74 @@ class BiYamFollower(Robot):
 
     @property
     def extra_dataset_features(self) -> dict[str, dict]:
-        """Per-arm torque columns that bypass the standard hw_to_dataset_features lumping.
+        """Extra columns that bypass the standard hw_to_dataset_features lumping.
 
-        Returns empty when `config.record_torques` is False. When enabled, emits
-        `observation.left_torques` and `observation.right_torques` columns built
-        from the flat `.eff` keys produced by `get_observation()`. Consumed by
-        `lerobot.scripts.lerobot_record` via
-        `getattr(robot, "extra_dataset_features", {})`.
+        Gated on two independent config flags:
+        - `record_torques`: `observation.left_torques` / `observation.right_torques`,
+          from the flat `.eff` keys produced by `get_observation()`.
+        - `record_eef_pose`: `observation.state_eef_absolute` (both arms, from FK on the
+          follower's own joint positions), `action_eef_absolute` (both arms, from FK on the
+          leader's commanded joint positions), and `action_eef_delta` (target minus this
+          tick's observed follower pose). Each carries the gripper DOF alongside the 7 pose
+          values (same control authority as the joint-space columns) — see
+          `EEF_POSE_NAMES_WITH_GRIPPER`. See `dataset_feature_renames` for the matching
+          joint-space renames. Consumed by `lerobot.scripts.lerobot_record` via
+          `getattr(robot, "extra_dataset_features", {})`.
         """
-        if not getattr(self.config, "record_torques", False):
-            return {}
-
         features: dict[str, dict] = {}
-        for side in ("left", "right"):
-            names = list(self._build_per_arm_features(side, "eff").keys())
-            features[f"observation.{side}_torques"] = {
+
+        if getattr(self.config, "record_torques", False):
+            for side in ("left", "right"):
+                names = list(self._build_per_arm_features(side, "eff").keys())
+                features[f"observation.{side}_torques"] = {
+                    "dtype": "float32",
+                    "shape": (len(names),),
+                    "names": names,
+                }
+
+        if getattr(self.config, "record_eef_pose", False):
+            abs_names = [
+                f"{side}_eef.{axis}" for side in ("left", "right") for axis in EEF_POSE_NAMES_WITH_GRIPPER
+            ]
+            features["observation.state_eef_absolute"] = {
                 "dtype": "float32",
-                "shape": (len(names),),
-                "names": names,
+                "shape": (len(abs_names),),
+                "names": abs_names,
             }
+            # The leader teleoperator's get_action() is what actually populates these
+            # `{side}_eef.*` values for the action side (see bi_yam_leader.py); this
+            # just declares the resulting dataset column.
+            features["action_eef_absolute"] = {
+                "dtype": "float32",
+                "shape": (len(abs_names),),
+                "names": abs_names,
+            }
+            # `{side}_eef_delta.*` is populated by BiYamLeader.augment_action_with_observation
+            # (target_eef - this tick's observed follower eef), which only has something to
+            # compute once this same flag has put `{side}_eef.*` into the observation dict.
+            delta_names = [
+                f"{side}_eef_delta.{axis}" for side in ("left", "right") for axis in EEF_POSE_NAMES_WITH_GRIPPER
+            ]
+            features["action_eef_delta"] = {
+                "dtype": "float32",
+                "shape": (len(delta_names),),
+                "names": delta_names,
+            }
+
         return features
+
+    @property
+    def dataset_feature_renames(self) -> dict[str, str]:
+        """Rename the standard `action` / `observation.state` columns when EEF columns are on.
+
+        Keeps the joint-space data (still the full, unmodified DOF set) but names it
+        `action_joint_angles` / `observation.state_joint_angles` so it sits clearly
+        alongside the `*_eef_absolute` / `*_eef_delta` columns from `extra_dataset_features`
+        instead of colliding with the generic `action` / `observation.state` names.
+        """
+        if not getattr(self.config, "record_eef_pose", False):
+            return {}
+        return {"action": "action_joint_angles", "observation.state": "observation.state_joint_angles"}
 
     @property
     def is_connected(self) -> bool:
@@ -294,21 +343,22 @@ class BiYamFollower(Robot):
             else:
                 obs_dict[f"{side}_joint_{i}.pos"] = pos
 
-        if not getattr(self.config, "record_torques", False):
-            return
+        if getattr(self.config, "record_torques", False):
+            joint_eff = arm_obs.get("joint_eff")
+            if joint_eff is not None:
+                if has_gripper and "gripper_eff" in arm_obs:
+                    joint_eff = np.concatenate([joint_eff, arm_obs["gripper_eff"]])
 
-        joint_eff = arm_obs.get("joint_eff")
-        if joint_eff is None:
-            return
+                for i, eff in enumerate(joint_eff):
+                    if has_gripper and i == len(joint_eff) - 1:
+                        obs_dict[f"{side}_gripper.eff"] = eff
+                    else:
+                        obs_dict[f"{side}_joint_{i}.eff"] = eff
 
-        if has_gripper and "gripper_eff" in arm_obs:
-            joint_eff = np.concatenate([joint_eff, arm_obs["gripper_eff"]])
-
-        for i, eff in enumerate(joint_eff):
-            if has_gripper and i == len(joint_eff) - 1:
-                obs_dict[f"{side}_gripper.eff"] = eff
-            else:
-                obs_dict[f"{side}_joint_{i}.eff"] = eff
+        if getattr(self.config, "record_eef_pose", False):
+            eef_pose = eef_pose_from_joint_pos(joint_pos)
+            for axis in EEF_POSE_NAMES_WITH_GRIPPER:
+                obs_dict[f"{side}_eef.{axis}"] = eef_pose[axis]
 
     def send_action(self, action: dict[str, Any]) -> dict[str, Any]:
         """

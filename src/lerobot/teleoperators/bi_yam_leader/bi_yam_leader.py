@@ -23,6 +23,15 @@ import portal
 from ..teleoperator import Teleoperator
 from .config_bi_yam_leader import BiYamLeaderConfig
 
+# Local import path: bi_yam_follower.eef_kinematics has no dependency on the follower robot
+# class itself, just the shared YAM-arm FK model. See its docstring for why this one model
+# (built from the follower's linear_4310 gripper) is valid for the leader's action too.
+from lerobot.robots.bi_yam_follower.eef_kinematics import (
+    EEF_POSE_NAMES_WITH_GRIPPER,
+    eef_pose_delta,
+    eef_pose_from_joint_pos,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -265,7 +274,36 @@ class BiYamLeader(Teleoperator):
             else:
                 action_dict[f"right_joint_{i}.pos"] = float(pos)
 
+        # Always computed (cheap); only picked up into the dataset schema when the robot's
+        # `record_eef_pose=True` declares the `action_eef_absolute` column that consumes
+        # these flat keys (see BiYamFollower.extra_dataset_features / build_dataset_frame).
+        for side, joint_pos in (("left", left_joint_pos), ("right", right_joint_pos)):
+            eef_pose = eef_pose_from_joint_pos(joint_pos)
+            for axis in EEF_POSE_NAMES_WITH_GRIPPER:
+                action_dict[f"{side}_eef.{axis}"] = eef_pose[axis]
+
         return action_dict
+
+    def augment_action_with_observation(
+        self, action: dict[str, float], observation: dict[str, float]
+    ) -> dict[str, float]:
+        """Add `{side}_eef_delta.*` = this action's EEF pose minus the follower's current EEF pose.
+
+        Called by `lerobot.scripts.lerobot_record.record_loop` (a generic, opt-in hook -
+        `hasattr(teleop, "augment_action_with_observation")`) right after `get_action()`,
+        with `observation` being this same tick's raw `robot.get_observation()` output.
+        No-op unless the robot's `record_eef_pose=True` has put `{side}_eef.*` keys into
+        `observation` (i.e. only meaningful for a `bi_yam_follower` with that flag set).
+        """
+        for side in ("left", "right"):
+            if f"{side}_eef.x" not in observation:
+                continue
+            target_pose = {axis: action[f"{side}_eef.{axis}"] for axis in EEF_POSE_NAMES_WITH_GRIPPER}
+            current_pose = {axis: observation[f"{side}_eef.{axis}"] for axis in EEF_POSE_NAMES_WITH_GRIPPER}
+            delta = eef_pose_delta(target_pose, current_pose)
+            for axis in EEF_POSE_NAMES_WITH_GRIPPER:
+                action[f"{side}_eef_delta.{axis}"] = delta[axis]
+        return action
 
     def send_feedback(self, feedback: dict[str, float]) -> None:
         """

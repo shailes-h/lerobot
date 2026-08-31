@@ -44,6 +44,16 @@ class BiYamFollowerConfig(RobotConfig):
     # `--robot.record_torques=true` on the lerobot-record CLI.
     record_torques: bool = False
 
+    # When True, also record forward-kinematics end-effector poses (xyz + wxyz quaternion,
+    # world frame) alongside the existing joint-space data: `observation.state_eef_absolute`,
+    # `action_eef_absolute`, `action_eef_delta` (plus the joint-space columns renamed to
+    # `observation.state_joint_angles` / `action_joint_angles` — see
+    # `BiYamFollower.dataset_feature_renames`). Defaults to True. Set
+    # `--robot.record_eef_pose=false` to fall back to the plain `action` /
+    # `observation.state` joint-space-only schema (e.g. for compatibility with an existing
+    # joint-space-only pipeline).
+    record_eef_pose: bool = True
+
     # Cameras (shared between both arms)
     cameras: dict[str, CameraConfig] = field(default_factory=dict)
 

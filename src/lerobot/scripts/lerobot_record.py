@@ -327,6 +327,12 @@ def record_loop(
             # Applies a pipeline to the raw teleop action, default is IdentityProcessor
             act_processed_teleop = teleop_action_processor((act, obs))
 
+            # Optional per-teleop hook for action fields that need this tick's live robot
+            # observation (e.g. a target-vs-current delta) rather than just the raw action.
+            # No-op unless the teleoperator defines it; every other teleop is unaffected.
+            if hasattr(teleop, "augment_action_with_observation"):
+                act_processed_teleop = teleop.augment_action_with_observation(act_processed_teleop, obs)
+
         elif policy is None and isinstance(teleop, list):
             arm_action = teleop_arm.get_action()
             arm_action = {f"arm_{k}": v for k, v in arm_action.items()}
@@ -408,6 +414,14 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         dataset_features,
         getattr(robot, "extra_dataset_features", {}) or {},
     )
+
+    # Optional: a robot may want the standard `action` / `observation.state` columns under
+    # different names (e.g. to sit alongside other `action_*` / `observation.state_*`
+    # columns it defines via `extra_dataset_features`). Backward-compatible: robots that
+    # don't define the property are unaffected.
+    for old_key, new_key in (getattr(robot, "dataset_feature_renames", {}) or {}).items():
+        if old_key in dataset_features:
+            dataset_features[new_key] = dataset_features.pop(old_key)
 
     if cfg.resume:
         dataset = LeRobotDataset(
