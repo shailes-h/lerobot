@@ -39,11 +39,11 @@ Enter):
           session instead (no more episodes).
     n  -- next: after you've reset the scene, start inference for the next episode.
 
-Each episode is recorded to two mp4s (all 3 camera views tiled into one frame, plus a
-second recording of just the `top` camera at its native resolution/fps and max quality --
-exactly as the robot saw it; the outcome is reflected only in the filenames, not burned
-into the video), and every episode's outcome plus a running success rate is appended to a
-per-session log directory:
+Every episode's lightweight eval artifacts are always written: two mp4s (all 3 camera views
+tiled into one frame, plus a second recording of just the `top` camera at its native
+resolution/fps and max quality -- exactly as the robot saw it; the outcome is reflected only
+in the filenames, not burned into the video), and every episode's outcome plus a running
+success rate is appended to a per-session log directory:
 
     <output_dir>/<YYYYMMDD_HHMMSS>/
       videos/episode_001_success.mp4
@@ -52,6 +52,14 @@ per-session log directory:
       videos/episode_002_failure_top.mp4
       log.jsonl        # one JSON line per episode
       summary.txt       # human-readable running + final success rate
+
+Pass `--record_dataset=true` to ALSO record every episode as a native LeRobotDataset episode
+(the same Parquet, per-camera MP4, and metadata layout produced by `lerobot-record`, with
+each frame's `task` set to your `--task` prompt) -- so eval rollouts can be replayed with
+`lerobot-replay-bi-yam`, inspected the same way as a teleop recording, or folded into a
+training set. No `--dataset.*` flags needed: it's written to
+`<output_dir>/<YYYYMMDD_HHMMSS>/dataset` (same session folder as the artifacts above) and
+named `local/<timestamp>_<task_slug>`.
 
 Usage:
 
@@ -66,7 +74,8 @@ top: {"type": "intelrealsense", "serial_number_or_name": "262522074294", "width"
   --server_url=https://untaken-eskimo-penholder.ngrok-free.dev/act \
   --task="Put all blocks into the box." \
   --actions_per_chunk=15 \
-  --max_episodes=50
+  --max_episodes=50 \
+  --record_dataset=true
 ```
 """
 
@@ -85,14 +94,23 @@ import numpy as np
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig  # noqa: F401
 from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig  # noqa: F401
 from lerobot.configs import parser
-from lerobot.processor import make_default_robot_action_processor
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.datasets.pipeline_features import (
+    aggregate_pipeline_dataset_features,
+    create_initial_features,
+)
+from lerobot.datasets.utils import build_dataset_frame, combine_feature_dicts
+from lerobot.datasets.video_utils import VideoEncodingManager
+from lerobot.processor import make_default_processors
 from lerobot.robots.bi_yam_follower.bi_yam_follower import BiYamFollower
 from lerobot.robots.bi_yam_follower.config_bi_yam_follower import BiYamFollowerConfig
 from lerobot.robots.bi_yam_follower.eef_kinematics import (
     EEF_POSE_NAMES_WITH_GRIPPER,
+    eef_pose_delta,
     eef_pose_from_joint_pos,
     ik_from_eef_pose,
 )
+from lerobot.utils.constants import ACTION, OBS_STR
 from lerobot.utils.robot_utils import busy_wait
 from lerobot.utils.utils import init_logging, log_say
 
@@ -102,8 +120,33 @@ VIDEO_TILE_WH = (320, 240)  # per-camera tile size in the composed mp4 frame
 
 
 @dataclass
+class DatasetRecordConfig:
+    """LeRobot dataset output settings, intentionally aligned with lerobot-record.
+
+    Not exposed on the CLI directly -- built internally by `_build_dataset_record_config`
+    from `--record_dataset`/`--output_dir`/`--task`/the session timestamp, so a dataset
+    (when requested) always lands next to that session's eval_logs, named after it."""
+
+    repo_id: str
+    root: str | Path | None = None
+    fps: int = 30
+    video: bool = True
+    push_to_hub: bool = False
+    private: bool = True
+    tags: list[str] | None = None
+    num_image_writer_processes: int = 0
+    num_image_writer_threads_per_camera: int = 4
+    video_encoding_batch_size: int = 1
+
+
+@dataclass
 class EvalYamHttpPolicyConfig:
     robot: BiYamFollowerConfig
+    # If true, also record eval rollouts as a native LeRobotDataset episode (the lightweight
+    # tiled-mp4/session-log artifacts are always written regardless). The dataset is written
+    # under this same run's `<output_dir>/<timestamp>/dataset` directory, named after the
+    # session timestamp -- see `_build_dataset_record_config`.
+    record_dataset: bool = False
     server_url: str = "https://untaken-eskimo-penholder.ngrok-free.dev/act"
     task: str = "Put all blocks into the box."
     # How many of the returned chunk's 30 rows to actually execute before re-querying the
@@ -189,6 +232,74 @@ def _action_row_to_pose(row: np.ndarray, side_idx: int) -> dict[str, float]:
     """One arm's 8 values out of a flat 16-D action row -- `EEF_POSE_NAMES_WITH_GRIPPER` order."""
     values = row[side_idx * 8 : side_idx * 8 + 8]
     return dict(zip(EEF_POSE_NAMES_WITH_GRIPPER, (float(v) for v in values)))
+
+
+def _augment_action_for_dataset(action: dict[str, float], row: np.ndarray, obs: dict) -> None:
+    """Add the EEF action fields declared by BiYamFollower's native dataset schema."""
+    for side_idx, side in enumerate(SIDES):
+        target_pose = _action_row_to_pose(row, side_idx)
+        for axis, value in target_pose.items():
+            action[f"{side}_eef.{axis}"] = value
+
+        if f"{side}_eef.x" in obs:
+            current_pose = {axis: obs[f"{side}_eef.{axis}"] for axis in EEF_POSE_NAMES_WITH_GRIPPER}
+            delta = eef_pose_delta(target_pose, current_pose)
+            for axis, value in delta.items():
+                action[f"{side}_eef_delta.{axis}"] = float(value)
+
+
+def _build_dataset_record_config(cfg: EvalYamHttpPolicyConfig, timestamp: str) -> DatasetRecordConfig:
+    """Only called when `--record_dataset=true`. Places the dataset inside this run's own
+    `<output_dir>/<timestamp>/` session folder (alongside `videos/`, `log.jsonl`,
+    `summary.txt`) and names it after that same timestamp -- so it always lives right next
+    to the eval_logs it belongs to and never needs a separate `--dataset.repo_id`/`--dataset.root`
+    from you. `repo_id` embeds both the timestamp and the task prompt you're evaling with
+    (slugified), so the dataset is self-describing without opening it."""
+    task_slug = "".join(c if c.isalnum() else "_" for c in cfg.task.strip().lower()).strip("_")
+    task_slug = "_".join(filter(None, task_slug.split("_")))  # collapse repeated underscores
+    repo_id = f"local/{timestamp}_{task_slug}" if task_slug else f"local/{timestamp}"
+    root = Path(cfg.output_dir) / timestamp / "dataset"
+    # DatasetRecordConfig.fps must be an int -- PyAV's add_stream() needs a Fraction-
+    # convertible fps (int/Fraction), not a bare float; control_hz is a float (default 30.0)
+    # to allow fractional control rates, so it's cast down here at the dataset boundary only.
+    return DatasetRecordConfig(repo_id=repo_id, root=root, fps=int(round(cfg.control_hz)))
+
+
+def _create_dataset(
+    dataset_cfg: DatasetRecordConfig,
+    robot: BiYamFollower,
+    teleop_action_processor,
+    robot_observation_processor,
+) -> LeRobotDataset:
+    """Build exactly the feature schema used by lerobot-record for this robot."""
+    features = combine_feature_dicts(
+        aggregate_pipeline_dataset_features(
+            pipeline=teleop_action_processor,
+            initial_features=create_initial_features(action=robot.action_features),
+            use_videos=dataset_cfg.video,
+        ),
+        aggregate_pipeline_dataset_features(
+            pipeline=robot_observation_processor,
+            initial_features=create_initial_features(observation=robot.observation_features),
+            use_videos=dataset_cfg.video,
+        ),
+    )
+    features = combine_feature_dicts(features, robot.extra_dataset_features or {})
+    for old_key, new_key in (robot.dataset_feature_renames or {}).items():
+        if old_key in features:
+            features[new_key] = features.pop(old_key)
+
+    return LeRobotDataset.create(
+        dataset_cfg.repo_id,
+        dataset_cfg.fps,
+        root=dataset_cfg.root,
+        robot_type=robot.name,
+        features=features,
+        use_videos=dataset_cfg.video,
+        image_writer_processes=dataset_cfg.num_image_writer_processes,
+        image_writer_threads=dataset_cfg.num_image_writer_threads_per_camera * len(robot.cameras),
+        batch_encoding_size=dataset_cfg.video_encoding_batch_size,
+    )
 
 
 def _request_with_retries(fn, retries: int = 5, backoff_s: float = 2.0):
@@ -327,8 +438,9 @@ class EpisodeRecorder:
 
 
 class SessionLog:
-    def __init__(self, output_dir: str):
-        self.session_dir = Path(output_dir) / datetime.now().strftime("%Y%m%d_%H%M%S")
+    def __init__(self, output_dir: str, timestamp: str | None = None):
+        self.timestamp = timestamp or datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.session_dir = Path(output_dir) / self.timestamp
         self.videos_dir = self.session_dir / "videos"
         self.videos_dir.mkdir(parents=True, exist_ok=True)
         self.log_path = self.session_dir / "log.jsonl"
@@ -425,6 +537,8 @@ def _run_episode(
     key_q: queue.Queue,
     episode: int,
     session: "SessionLog",
+    dataset: LeRobotDataset | None,
+    robot_observation_processor,
 ) -> tuple[str, "EpisodeRecorder"]:
     """Home, then run the policy loop until `s`/`f` is typed. Returns the outcome ('success'
     or 'failure')."""
@@ -519,8 +633,20 @@ def _run_episode(
 
             robot_obs = robot.get_observation()
             recorder.write(robot_obs)
+
+            if dataset is not None:
+                dataset_action = action.copy()
+                _augment_action_for_dataset(dataset_action, actions[i], robot_obs)
+                observation_frame = build_dataset_frame(
+                    dataset.features, robot_observation_processor(robot_obs), prefix=OBS_STR
+                )
+                action_frame = build_dataset_frame(dataset.features, dataset_action, prefix=ACTION)
+
             processed_action = robot_action_processor((action, robot_obs))
             robot.send_action(processed_action)
+
+            if dataset is not None:
+                dataset.add_frame({**observation_frame, **action_frame, "task": cfg.task})
 
             busy_wait(period_s - (time.perf_counter() - row_start))
 
@@ -550,7 +676,7 @@ def eval_policy(cfg: EvalYamHttpPolicyConfig):
     # under the patched decoder hook. Same issue called out in
     # `host_policy_server_reference.py`'s module docstring. So: connect + do one FK call
     # first (forces the scipy import), patch only after.
-    robot_action_processor = make_default_robot_action_processor()
+    teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors()
     robot = BiYamFollower(cfg.robot)
     robot.connect()
 
@@ -570,7 +696,35 @@ def eval_policy(cfg: EvalYamHttpPolicyConfig):
     if list(health.get("camera_keys", [])) != ["top", "left", "right"]:
         raise RuntimeError(f"unexpected server camera_keys: {health.get('camera_keys')}")
 
-    session = SessionLog(cfg.output_dir)
+    # Shared by both the session log dir and (if enabled) the dataset dir/name, so they're
+    # always found together under `<output_dir>/<timestamp>/`.
+    session_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    if cfg.record_dataset:
+        dataset_cfg = _build_dataset_record_config(cfg, session_timestamp)
+        logging.info(f"Recording dataset to {dataset_cfg.root} (repo_id={dataset_cfg.repo_id})")
+        dataset = _create_dataset(dataset_cfg, robot, teleop_action_processor, robot_observation_processor)
+        video_encoding_manager = VideoEncodingManager(dataset)
+        video_encoding_manager.__enter__()
+    else:
+        logging.info("--record_dataset not set -- eval rollouts will NOT be recorded as a dataset.")
+        dataset_cfg = None
+        dataset = None
+        video_encoding_manager = None
+    dataset_closed = False
+
+    def close_dataset(interrupted: bool = False) -> None:
+        nonlocal dataset_closed
+        if dataset_closed or dataset is None:
+            dataset_closed = True
+            return
+        exc_type = RuntimeError if interrupted else None
+        video_encoding_manager.__exit__(exc_type, None, None)
+        if dataset_cfg.push_to_hub:
+            dataset.push_to_hub(tags=dataset_cfg.tags, private=dataset_cfg.private)
+        dataset_closed = True
+
+    session = SessionLog(cfg.output_dir, timestamp=session_timestamp)
     key_q = _start_key_listener()
 
     try:
@@ -586,18 +740,29 @@ def eval_policy(cfg: EvalYamHttpPolicyConfig):
 
         if key == "z":
             print("[eval] finishing with 0 episodes run.")
+            close_dataset()
             _cleanup_and_exit(cfg, robot, robot_action_processor, session, "quit before any episode")
             return
 
         episode = 1
         while True:
             outcome, recorder = _run_episode(
-                cfg, robot, robot_action_processor, requests, key_q, episode, session
+                cfg,
+                robot,
+                robot_action_processor,
+                requests,
+                key_q,
+                episode,
+                session,
+                dataset,
+                robot_observation_processor,
             )
 
             final_path = session.videos_dir / f"episode_{episode:03d}_{outcome}.mp4"
             final_top_path = session.videos_dir / f"episode_{episode:03d}_{outcome}_top.mp4"
             recorder.finalize(final_path, final_top_path, outcome)
+            if dataset is not None:
+                dataset.save_episode()
             session.record_episode(episode, outcome, final_path, recorder.n_frames, recorder.fps)
             print(f"[eval] saved {final_path}")
             print(f"[eval] saved {final_top_path}")
@@ -624,10 +789,17 @@ def eval_policy(cfg: EvalYamHttpPolicyConfig):
         summary = session.finalize()
         print(f"[eval] {summary}")
         print(f"[eval] session log: {session.session_dir}")
+        close_dataset()
         robot.disconnect()
 
     except KeyboardInterrupt:
+        close_dataset(interrupted=True)
         _cleanup_and_exit(cfg, robot, robot_action_processor, session, "Ctrl+C received")
+
+    except Exception:
+        close_dataset(interrupted=True)
+        _cleanup_and_exit(cfg, robot, robot_action_processor, session, "evaluation aborted by an error")
+        raise
 
 
 def main():
