@@ -39,13 +39,17 @@ Enter):
           session instead (no more episodes).
     n  -- next: after you've reset the scene, start inference for the next episode.
 
-Each episode is recorded to its own mp4 (all 3 camera views tiled into one frame,
-success/failure annotated on the video once the outcome is known), and every episode's
-outcome plus a running success rate is appended to a per-session log directory:
+Each episode is recorded to two mp4s (all 3 camera views tiled into one frame, plus a
+second recording of just the `top` camera at its native resolution/fps and max quality --
+exactly as the robot saw it; the outcome is reflected only in the filenames, not burned
+into the video), and every episode's outcome plus a running success rate is appended to a
+per-session log directory:
 
     <output_dir>/<YYYYMMDD_HHMMSS>/
       videos/episode_001_success.mp4
+      videos/episode_001_success_top.mp4
       videos/episode_002_failure.mp4
+      videos/episode_002_failure_top.mp4
       log.jsonl        # one JSON line per episode
       summary.txt       # human-readable running + final success rate
 
@@ -156,12 +160,12 @@ def _slow_reset(
     hz: float,
 ) -> None:
     """Linearly interpolate both arms' 6 joints from their current position to
-    `target_joint_pos` over `duration_s`, in joint space (no IK needed). Gripper is left
-    alone -- each step's action carries forward whatever the gripper's live position is, so
-    it doesn't jump open/closed during the reset."""
+    `target_joint_pos` over `duration_s`, in joint space (no IK needed). The gripper is
+    interpolated open (1.0 -- see `bi_yam_leader.py`'s "not pressed = open (1)") over the
+    same window, so every reset ends with both grippers open."""
     obs = robot.get_observation()
     start = {side: _current_arm_joint_pos(obs, side) for side in SIDES}
-    gripper = {side: obs[f"{side}_gripper.pos"] for side in SIDES}
+    gripper_start = {side: obs[f"{side}_gripper.pos"] for side in SIDES}
 
     n_steps = max(1, int(duration_s * hz))
     period_s = 1.0 / hz
@@ -173,7 +177,7 @@ def _slow_reset(
             q = (1 - alpha) * start[side] + alpha * target_joint_pos
             for j, val in enumerate(q):
                 action[f"{side}_joint_{j}.pos"] = float(val)
-            action[f"{side}_gripper.pos"] = float(gripper[side])
+            action[f"{side}_gripper.pos"] = float((1 - alpha) * gripper_start[side] + alpha * 1.0)
 
         robot_obs = robot.get_observation()
         processed_action = robot_action_processor((action, robot_obs))
@@ -250,9 +254,11 @@ def _poll_key(q: queue.Queue, valid: set[str]) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Per-episode mp4 recording: all 3 camera views tiled into one frame, annotated with the
-# success/failure outcome once it's known (outcome is only known after the episode ends, so
-# recording writes a raw file first and a quick second pass burns the annotation in).
+# Per-episode mp4 recording: all 3 camera views tiled into one frame, plus a second,
+# separate max-quality recording of just the `top` camera at native resolution/fps. The
+# outcome is only known after the episode ends, so recording writes to raw temp files first
+# and they're simply moved to their final `..._success[_top].mp4` / `..._failure[_top].mp4`
+# names once the outcome is known.
 # ---------------------------------------------------------------------------
 
 
@@ -264,41 +270,54 @@ def _compose_frame(obs: dict) -> np.ndarray:
     return cv2.hconcat(tiles)
 
 
+def _top_frame(obs: dict) -> np.ndarray:
+    """The `top` camera frame at its native resolution, un-resized/un-tiled -- exactly what
+    the robot saw, for the standalone max-quality per-episode top-camera video."""
+    return cv2.cvtColor(np.asarray(obs["top"]), cv2.COLOR_RGB2BGR)  # cameras hand back RGB; cv2 wants BGR
+
+
 class EpisodeRecorder:
-    def __init__(self, raw_path: Path, fps: float, frame_shape: tuple[int, int]):
-        h, w = frame_shape[:2]
+    """Writes two mp4s per episode: the tiled 3-camera overview (small, for a quick look),
+    and a second recording of just the `top` camera at its native resolution/fps and with a
+    high-quality codec setting -- as close to what the robot's camera actually saw as
+    `cv2.VideoWriter` allows (mp4v's default lossy quantization noticeably softens fine
+    detail at the tiles' downscaled 320x240)."""
+
+    def __init__(self, raw_path: Path, raw_top_path: Path, fps: float, obs: dict):
+        tiled_shape = _compose_frame(obs).shape
+        top_shape = _top_frame(obs).shape
+        h, w = tiled_shape[:2]
+        top_h, top_w = top_shape[:2]
+
         self.raw_path = raw_path
+        self.raw_top_path = raw_top_path
         self.fps = fps
         self._writer = cv2.VideoWriter(str(raw_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+        self._top_writer = cv2.VideoWriter(
+            str(raw_top_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (top_w, top_h)
+        )
+        # Bump the top-camera writer's JPEG quality knob to its max (100) -- mp4v internally
+        # quantizes per-frame like JPEG, and OpenCV honors this property for it. Silently a
+        # no-op on builds/codecs that don't support the property.
+        self._top_writer.set(cv2.VIDEOWRITER_PROP_QUALITY, 100)
         self.n_frames = 0
 
     def write(self, obs: dict) -> None:
         self._writer.write(_compose_frame(obs))
+        self._top_writer.write(_top_frame(obs))
         self.n_frames += 1
 
     def close(self) -> None:
         self._writer.release()
+        self._top_writer.release()
 
-    def finalize(self, final_path: Path, outcome: str) -> None:
-        """Burn an outcome banner into every frame of the raw recording and write it to
-        `final_path`, then delete the raw file."""
+    def finalize(self, final_path: Path, final_top_path: Path, outcome: str) -> None:
+        """Move the raw recordings to their final paths. `outcome` is unused for the videos
+        themselves (the success/failure is already encoded in the filenames) but kept in the
+        signature for callers/logging."""
         self.close()
-        cap = cv2.VideoCapture(str(self.raw_path))
-        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        writer = cv2.VideoWriter(str(final_path), cv2.VideoWriter_fourcc(*"mp4v"), self.fps, (w, h))
-        color = (0, 170, 0) if outcome == "success" else (0, 0, 220)  # BGR
-        label = outcome.upper()
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
-            cv2.rectangle(frame, (0, 0), (w, 36), color, -1)
-            cv2.putText(frame, label, (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
-            writer.write(frame)
-        cap.release()
-        writer.release()
-        self.raw_path.unlink(missing_ok=True)
+        self.raw_path.replace(final_path)
+        self.raw_top_path.replace(final_top_path)
 
 
 # ---------------------------------------------------------------------------
@@ -412,9 +431,10 @@ def _run_episode(
     _home(cfg, robot, robot_action_processor)
 
     video_fps = cfg.video_fps or cfg.control_hz
-    raw_path = session.session_dir / f"_raw_tmp_episode_{episode:03d}.mp4"  # deleted by recorder.finalize()
+    raw_path = session.session_dir / f"_raw_tmp_episode_{episode:03d}.mp4"  # renamed by recorder.finalize()
+    raw_top_path = session.session_dir / f"_raw_tmp_episode_{episode:03d}_top.mp4"
     obs = robot.get_observation()
-    recorder = EpisodeRecorder(raw_path, video_fps, _compose_frame(obs).shape)
+    recorder = EpisodeRecorder(raw_path, raw_top_path, video_fps, obs)
 
     log_say(f"Starting episode {episode}: {cfg.task}", cfg.play_sounds, blocking=True)
     print(f"[eval] episode {episode} RUNNING")
@@ -576,9 +596,11 @@ def eval_policy(cfg: EvalYamHttpPolicyConfig):
             )
 
             final_path = session.videos_dir / f"episode_{episode:03d}_{outcome}.mp4"
-            recorder.finalize(final_path, outcome)
+            final_top_path = session.videos_dir / f"episode_{episode:03d}_{outcome}_top.mp4"
+            recorder.finalize(final_path, final_top_path, outcome)
             session.record_episode(episode, outcome, final_path, recorder.n_frames, recorder.fps)
             print(f"[eval] saved {final_path}")
+            print(f"[eval] saved {final_top_path}")
 
             if episode >= cfg.max_episodes:
                 print(f"[eval] max_episodes={cfg.max_episodes} reached -- finishing.")
