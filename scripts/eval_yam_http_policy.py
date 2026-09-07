@@ -54,12 +54,22 @@ success rate is appended to a per-session log directory:
       summary.txt       # human-readable running + final success rate
 
 Pass `--record_dataset=true` to ALSO record every episode as a native LeRobotDataset episode
-(the same Parquet, per-camera MP4, and metadata layout produced by `lerobot-record`, with
+(the same Parquet, per-camera-frames, and metadata layout produced by `lerobot-record`, with
 each frame's `task` set to your `--task` prompt) -- so eval rollouts can be replayed with
 `lerobot-replay-bi-yam`, inspected the same way as a teleop recording, or folded into a
 training set. No `--dataset.*` flags needed: it's written to
 `<output_dir>/<YYYYMMDD_HHMMSS>/dataset` (same session folder as the artifacts above) and
 named `local/<timestamp>_<task_slug>`.
+
+Episodes are saved RAW: no video encoding happens during the session (nothing to stall an
+eval episode mid-rollout) or even at the end when you close the session -- camera frames are
+just loose per-frame PNGs on disk. Once you're done evaling, encode them into the dataset's
+mp4s with:
+
+```shell
+python scripts/encode_pending_videos.py --repo-id local/<timestamp>_<task_slug> \
+  --root <output_dir>/<YYYYMMDD_HHMMSS>/dataset
+```
 
 Usage:
 
@@ -82,6 +92,7 @@ top: {"type": "intelrealsense", "serial_number_or_name": "262522074294", "width"
 import json
 import logging
 import queue
+import shutil
 import threading
 import time
 from dataclasses import dataclass
@@ -100,7 +111,6 @@ from lerobot.datasets.pipeline_features import (
     create_initial_features,
 )
 from lerobot.datasets.utils import build_dataset_frame, combine_feature_dicts
-from lerobot.datasets.video_utils import VideoEncodingManager
 from lerobot.processor import make_default_processors
 from lerobot.robots.bi_yam_follower.bi_yam_follower import BiYamFollower
 from lerobot.robots.bi_yam_follower.config_bi_yam_follower import BiYamFollowerConfig
@@ -145,7 +155,9 @@ class EvalYamHttpPolicyConfig:
     # If true, also record eval rollouts as a native LeRobotDataset episode (the lightweight
     # tiled-mp4/session-log artifacts are always written regardless). The dataset is written
     # under this same run's `<output_dir>/<timestamp>/dataset` directory, named after the
-    # session timestamp -- see `_build_dataset_record_config`.
+    # session timestamp -- see `_build_dataset_record_config`. Saved RAW (no video encoding
+    # during or at the end of this session) -- run `scripts/encode_pending_videos.py`
+    # afterward.
     record_dataset: bool = False
     server_url: str = "https://untaken-eskimo-penholder.ngrok-free.dev/act"
     task: str = "Put all blocks into the box."
@@ -262,7 +274,16 @@ def _build_dataset_record_config(cfg: EvalYamHttpPolicyConfig, timestamp: str) -
     # DatasetRecordConfig.fps must be an int -- PyAV's add_stream() needs a Fraction-
     # convertible fps (int/Fraction), not a bare float; control_hz is a float (default 30.0)
     # to allow fractional control rates, so it's cast down here at the dataset boundary only.
-    return DatasetRecordConfig(repo_id=repo_id, root=root, fps=int(round(cfg.control_hz)))
+    #
+    # video_encoding_batch_size is set absurdly high on purpose: this session never wants to
+    # pay for video encoding mid-run (it would stall the control loop for however long ffmpeg
+    # takes, right in the middle of an eval episode). Episodes are saved RAW -- images kept
+    # as loose per-frame PNGs on disk, never touched by `_batch_save_episode_video` -- and
+    # `eval_policy()`'s `close_dataset()` deliberately does NOT encode at session end either.
+    # Run `scripts/encode_pending_videos.py --repo-id ... --root ...` afterward to encode.
+    return DatasetRecordConfig(
+        repo_id=repo_id, root=root, fps=int(round(cfg.control_hz)), video_encoding_batch_size=10**6
+    )
 
 
 def _create_dataset(
@@ -702,26 +723,50 @@ def eval_policy(cfg: EvalYamHttpPolicyConfig):
 
     if cfg.record_dataset:
         dataset_cfg = _build_dataset_record_config(cfg, session_timestamp)
-        logging.info(f"Recording dataset to {dataset_cfg.root} (repo_id={dataset_cfg.repo_id})")
+        logging.info(
+            f"Recording dataset RAW (no video encoding this session) to {dataset_cfg.root} "
+            f"(repo_id={dataset_cfg.repo_id})"
+        )
         dataset = _create_dataset(dataset_cfg, robot, teleop_action_processor, robot_observation_processor)
-        video_encoding_manager = VideoEncodingManager(dataset)
-        video_encoding_manager.__enter__()
     else:
         logging.info("--record_dataset not set -- eval rollouts will NOT be recorded as a dataset.")
         dataset_cfg = None
         dataset = None
-        video_encoding_manager = None
     dataset_closed = False
 
     def close_dataset(interrupted: bool = False) -> None:
+        """Close the raw dataset without encoding any video. `video_encoding_batch_size` is
+        set absurdly high (see `_build_dataset_record_config`) precisely so episodes are
+        never auto-encoded mid-run; deliberately skip `VideoEncodingManager`'s exit-time
+        batch-encode too, so no video encoding happens in this process at all -- only
+        `scripts/encode_pending_videos.py`, run afterward, ever calls
+        `_batch_save_episode_video`. This mirrors that script's cleanup of a still-open
+        (never `save_episode()`-d) episode's raw images on interrupt, then just closes the
+        parquet writers."""
         nonlocal dataset_closed
         if dataset_closed or dataset is None:
             dataset_closed = True
             return
-        exc_type = RuntimeError if interrupted else None
-        video_encoding_manager.__exit__(exc_type, None, None)
+        if interrupted:
+            interrupted_episode_index = dataset.num_episodes
+            for key in dataset.meta.video_keys:
+                img_dir = dataset._get_image_file_path(
+                    episode_index=interrupted_episode_index, image_key=key, frame_index=0
+                ).parent
+                if img_dir.exists():
+                    logging.debug(f"Cleaning up interrupted episode images for camera {key}")
+                    shutil.rmtree(img_dir)
+        dataset.finalize()
+        logging.info(
+            f"Dataset saved RAW at {dataset_cfg.root} -- {dataset.num_episodes} episode(s) still need "
+            f"encoding. Run:\n  python scripts/encode_pending_videos.py "
+            f"--repo-id {dataset_cfg.repo_id} --root {dataset_cfg.root}"
+        )
         if dataset_cfg.push_to_hub:
-            dataset.push_to_hub(tags=dataset_cfg.tags, private=dataset_cfg.private)
+            logging.warning(
+                "--dataset.push_to_hub was set but the dataset is raw/unencoded -- skipping push. "
+                "Run encode_pending_videos.py first, then push manually."
+            )
         dataset_closed = True
 
     session = SessionLog(cfg.output_dir, timestamp=session_timestamp)
