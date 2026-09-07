@@ -13,6 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import logging
 import multiprocessing
 import queue
 import threading
@@ -57,7 +58,8 @@ def image_array_to_pil_image(image_array: np.ndarray, range_check: bool = True) 
 
     elif image_array.shape[-1] != 3:
         raise NotImplementedError(
-            f"The image has {image_array.shape[-1]} channels, but 3 is required for now."
+            f"The image has {image_array.shape[-1]} channels, but 3 is required for now "
+            "(except uint16 single-channel depth maps, handled above)."
         )
 
     if image_array.dtype != np.uint8:
@@ -76,7 +78,7 @@ def image_array_to_pil_image(image_array: np.ndarray, range_check: bool = True) 
     return PIL.Image.fromarray(image_array)
 
 
-def write_image(image: np.ndarray | PIL.Image.Image, fpath: Path, compress_level: int = 1):
+def write_image(image: np.ndarray | PIL.Image.Image, fpath: Path, compress_level: int = 1) -> Exception | None:
     """
     Saves a NumPy array or PIL Image to a file.
 
@@ -96,9 +98,14 @@ def write_image(image: np.ndarray | PIL.Image.Image, fpath: Path, compress_level
         TypeError: If the input 'image' is not a NumPy array or a
             PIL.Image.Image object.
 
-    Side Effects:
-        Prints an error message to the console if the image writing process
-        fails for any reason.
+    Returns:
+        The caught exception if writing failed, else None. Previously this was silently
+        swallowed (just `print()`ed) -- easy to miss under a busy recording session's
+        interleaved logging/progress bars, and a failure on every single frame of an
+        episode (e.g. a bad image array from a specific camera/dtype) would surface, if at
+        all, only much later as a confusing "No images found" error at video-encode time.
+        `worker_thread_loop`/`worker_process` now escalate this via `logging.error` with a
+        full traceback, immediately, from the frame that actually failed.
     """
     try:
         if isinstance(image, np.ndarray):
@@ -108,8 +115,9 @@ def write_image(image: np.ndarray | PIL.Image.Image, fpath: Path, compress_level
         else:
             raise TypeError(f"Unsupported image type: {type(image)}")
         img.save(fpath, compress_level=compress_level)
+        return None
     except Exception as e:
-        print(f"Error writing image {fpath}: {e}")
+        return e
 
 
 def worker_thread_loop(queue: queue.Queue):
@@ -119,7 +127,9 @@ def worker_thread_loop(queue: queue.Queue):
             queue.task_done()
             break
         image_array, fpath = item
-        write_image(image_array, fpath)
+        err = write_image(image_array, fpath)
+        if err is not None:
+            logging.error(f"Error writing image {fpath}: {err!r}", exc_info=err)
         queue.task_done()
 
 

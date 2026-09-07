@@ -1152,7 +1152,11 @@ class LeRobotDataset(torch.utils.data.Dataset):
         if self.image_writer is None:
             if isinstance(image, torch.Tensor):
                 image = image.cpu().numpy()
-            write_image(image, fpath)
+            err = write_image(image, fpath)
+            if err is not None:
+                # Synchronous (no AsyncImageWriter) path -- raise immediately rather than
+                # silently continuing to record with this frame's image missing on disk.
+                raise RuntimeError(f"Error writing image {fpath}: {err!r}") from err
         else:
             self.image_writer.save_image(image=image, fpath=fpath)
 
@@ -1567,7 +1571,20 @@ class LeRobotDataset(torch.utils.data.Dataset):
             episode_index = self.episode_buffer["episode_index"]
             if isinstance(episode_index, np.ndarray):
                 episode_index = episode_index.item() if episode_index.size == 1 else episode_index[0]
-            for cam_key in self.meta.camera_keys:
+            # Only `image`-dtype keys, NOT `video`-dtype ones (`self.meta.camera_keys` would
+            # include both). `image`-dtype PNGs are safe to delete here: `_save_episode_data`
+            # (already called by `save_episode` before this) reads and embeds their bytes
+            # into the parquet via `embed_images()`, so the on-disk copy is no longer needed.
+            # `video`-dtype PNGs are NOT necessarily safe yet: under batched encoding
+            # (`batch_encoding_size > 1`), a video key's raw frames deliberately survive
+            # un-encoded across multiple `save_episode()` calls until the batch threshold (or
+            # the final `VideoEncodingManager` flush) triggers `_encode_temporary_episode_video`
+            # -- which does its own `shutil.rmtree(img_dir)` right after encoding. Deleting
+            # them here too, unconditionally, was a real bug: any dataset with at least one
+            # `image`-dtype feature (this flag used to be permanently False when every camera
+            # was `video`-dtype) would have this delete a video key's not-yet-encoded frames,
+            # and the deferred encode would then fail with "No images found in ...".
+            for cam_key in self.meta.image_keys:
                 img_dir = self._get_image_file_dir(episode_index, cam_key)
                 if img_dir.is_dir():
                     shutil.rmtree(img_dir)
