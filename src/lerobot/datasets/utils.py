@@ -399,7 +399,20 @@ def load_image_as_numpy(
     Returns:
         np.ndarray: The image as a numpy array.
     """
-    img = PILImage.open(fpath).convert("RGB")
+    img = PILImage.open(fpath)
+    if img.mode in ("I;16", "I"):
+        # Single-channel uint16 depth map (see image_writer.image_array_to_pil_image) --
+        # NOT an RGB image: skip .convert("RGB") (which would destroy it -- collapsing raw
+        # millimeter values into a lossy 8-bit grayscale-as-RGB triple) and the /255
+        # normalization below (meaningless for depth, whose range is thousands of mm, not
+        # 0-255). Returned as (1, H, W) if channel_first else (H, W) -- there's only ever
+        # one channel, so the two only differ by that leading axis.
+        depth_array = np.array(img, dtype=np.uint16).astype(dtype)
+        if channel_first:
+            depth_array = depth_array[np.newaxis, ...]
+        return depth_array
+
+    img = img.convert("RGB")
     img_array = np.array(img, dtype=dtype)
     if channel_first:  # (H, W, C) -> (C, H, W)
         img_array = np.transpose(img_array, (2, 0, 1))

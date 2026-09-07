@@ -862,9 +862,12 @@ def _copy_and_reindex_episodes_metadata(
                                     while isinstance(item, np.ndarray):
                                         item = item.flatten()[0]
                                     flat_values.append(item)
-                                value = np.array(flat_values, dtype=np.float64).reshape(3, 1, 1)
-                            elif isinstance(value, np.ndarray) and value.shape == (3,):
-                                value = value.reshape(3, 1, 1)
+                                # Channel count varies (3 for RGB, 1 for grayscale/depth) --
+                                # derive it from the flattened value itself rather than assuming RGB.
+                                num_channels = len(flat_values)
+                                value = np.array(flat_values, dtype=np.float64).reshape(num_channels, 1, 1)
+                            elif isinstance(value, np.ndarray) and value.ndim == 1:
+                                value = value.reshape(value.shape[0], 1, 1)
 
                     episode_stats[feature_name][stat_name] = value
 

@@ -184,8 +184,23 @@ class BiYamFollower(Robot):
           `EEF_POSE_NAMES_WITH_GRIPPER`. See `dataset_feature_renames` for the matching
           joint-space renames. Consumed by `lerobot.scripts.lerobot_record` via
           `getattr(robot, "extra_dataset_features", {})`.
+        - per-camera `use_depth`: `observation.images.{cam}_depth`, a (H, W, 1) uint16 raw
+          millimeter depth map for each camera whose `CameraConfig.use_depth=True`. Declared
+          here (rather than folded into `_cameras_ft`) because it must stay `dtype: "image"`
+          (lossless per-frame PNG) even when the color stream is `dtype: "video"` -- lossy
+          video codecs aren't appropriate for depth, and the shape/dtype (single-channel
+          uint16 vs 3-channel uint8) differ from a color frame anyway. Populated by
+          `_populate_arm_obs`'s camera-reading sibling in `get_observation()`.
         """
         features: dict[str, dict] = {}
+
+        for cam_key, cam in self.cameras.items():
+            if getattr(cam.config, "use_depth", False):
+                features[f"observation.images.{cam_key}_depth"] = {
+                    "dtype": "image",
+                    "shape": (self.config.cameras[cam_key].height, self.config.cameras[cam_key].width, 1),
+                    "names": ["height", "width", "channels"],
+                }
 
         if getattr(self.config, "record_torques", False):
             for side in ("left", "right"):
@@ -313,6 +328,17 @@ class BiYamFollower(Robot):
             obs_dict[cam_key] = cam.async_read()
             dt_ms = (time.perf_counter() - start) * 1e3
             logger.debug(f"{self} read {cam_key}: {dt_ms:.1f}ms")
+
+            # See extra_dataset_features's use_depth doc -- only cameras configured with
+            # use_depth=True support this (currently just RealSenseCamera); async_read()
+            # above already advanced this camera's background read loop for this tick, so
+            # async_read_depth() returns the depth frame from that same frameset.
+            if getattr(cam.config, "use_depth", False):
+                start = time.perf_counter()
+                depth = cam.async_read_depth()
+                obs_dict[f"{cam_key}_depth"] = depth[..., np.newaxis]  # (H, W) -> (H, W, 1)
+                dt_ms = (time.perf_counter() - start) * 1e3
+                logger.debug(f"{self} read {cam_key}_depth: {dt_ms:.1f}ms")
 
         return obs_dict
 

@@ -20,6 +20,7 @@ import shutil
 from pathlib import Path
 
 import pandas as pd
+import pyarrow.parquet as pq
 import tqdm
 
 from lerobot.datasets.compute_stats import aggregate_stats
@@ -415,7 +416,12 @@ def aggregate_metadata(src_meta, dst_meta, meta_idx, data_idx, videos_idx):
     chunk_file_ids = sorted(chunk_file_ids)
     for chunk_idx, file_idx in chunk_file_ids:
         src_path = src_meta.root / DEFAULT_EPISODES_PATH.format(chunk_index=chunk_idx, file_index=file_idx)
-        df = pd.read_parquet(src_path)
+        # pd.read_parquet() chokes on this project's nested-list per-channel image/depth stat
+        # columns (TypeError: data type '...[pyarrow]' not understood) because pandas tries to
+        # honor the embedded pandas schema metadata and map those columns to ArrowDtype. Read via
+        # pyarrow directly and drop that metadata first so columns come back as plain object arrays.
+        table = pq.read_table(src_path).replace_schema_metadata(None)
+        df = table.to_pandas()
         df = update_meta_data(
             df,
             dst_meta,

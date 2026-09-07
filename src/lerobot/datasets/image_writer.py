@@ -39,7 +39,15 @@ def safe_stop_image_writer(func):
 
 
 def image_array_to_pil_image(image_array: np.ndarray, range_check: bool = True) -> PIL.Image.Image:
-    # TODO(aliberts): handle 1 channel and 4 for depth images
+    # Depth maps: single-channel uint16 (raw millimeters), shape (H, W) or (H, W, 1) -- saved
+    # as a 16-bit grayscale PNG (PIL mode "I;16") so precision is preserved losslessly,
+    # unlike the uint8 RGB path below which would clip/quantize the depth range.
+    if image_array.dtype == np.uint16 and (
+        image_array.ndim == 2 or (image_array.ndim == 3 and image_array.shape[-1] == 1)
+    ):
+        depth_2d = image_array[..., 0] if image_array.ndim == 3 else image_array
+        return PIL.Image.fromarray(depth_2d, mode="I;16")
+
     if image_array.ndim != 3:
         raise ValueError(f"The array has {image_array.ndim} dimensions, but 3 is expected for an image.")
 
