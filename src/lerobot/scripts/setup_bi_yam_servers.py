@@ -10,8 +10,8 @@ The follower servers will be controlled by LeRobot's bi_yam_follower robot.
 The leader servers expose the teaching handle positions to LeRobot's bi_yam_leader teleoperator.
 
 Expected CAN interfaces:
-- can_follower_r: Right follower arm
-- can_follower_l: Left follower arm  
+- can_follower2_r: Right follower arm
+- can_follower2_l: Left follower arm  
 - can_leader_r: Right leader arm (with teaching handle)
 - can_leader_l: Left leader arm (with teaching handle)
 
@@ -56,7 +56,7 @@ def check_can_interface(interface):
 
 def check_all_can_interfaces(eval_mode=False):
     """Check if all required CAN interfaces exist."""
-    required_interfaces = ["can_follower_r", "can_follower_l"]
+    required_interfaces = ["can_follower2_r", "can_follower2_l"]
     if not eval_mode:
         required_interfaces += ["can_leader_r", "can_leader_l"]
 
@@ -167,7 +167,7 @@ def main():
         server_configs = [
             # Right follower arm (standard server)
             {
-                "can_channel": "can_follower_r",
+                "can_channel": "can_follower2_r",
                 "gripper": "linear_4310",
                 "mode": "follower",
                 "server_port": 1234,
@@ -175,7 +175,7 @@ def main():
             },
             # Left follower arm (standard server)
             {
-                "can_channel": "can_follower_l",
+                "can_channel": "can_follower2_l",
                 "gripper": "linear_4310",
                 "mode": "follower",
                 "server_port": 1235,
