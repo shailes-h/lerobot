@@ -125,10 +125,13 @@ class RealSenseCamera(Camera):
         self.fps = config.fps
         self.color_mode = config.color_mode
         self.use_depth = config.use_depth
+        self.align_depth_to_color = config.align_depth_to_color
         self.warmup_s = config.warmup_s
 
         self.rs_pipeline: rs.pipeline | None = None
         self.rs_profile: rs.pipeline_profile | None = None
+        # Reprojects depth into the colour camera's frame; see `_aligned_frameset`.
+        self.rs_align: rs.align | None = None
 
         self.thread: Thread | None = None
         self.stop_event: Event | None = None
@@ -182,6 +185,10 @@ class RealSenseCamera(Camera):
             ) from e
 
         self._configure_capture_settings()
+
+        if self.use_depth and self.align_depth_to_color:
+            self.rs_align = rs.align(rs.stream.color)
+            logger.info(f"{self}: depth aligned to colour (rs.align).")
 
         if warmup:
             time.sleep(
@@ -313,6 +320,18 @@ class RealSenseCamera(Camera):
                 self.width, self.height = actual_width, actual_height
                 self.capture_width, self.capture_height = actual_width, actual_height
 
+    def _aligned_frameset(self, frame: Any) -> Any:
+        """Reproject depth into the colour frame, if alignment is enabled.
+
+        After this, depth pixel (u, v) is colour pixel (u, v) and the depth map
+        carries the colour intrinsics -- which is what any RGB-D consumer
+        (point clouds, depth lookups at image coordinates) assumes. Without it
+        the two streams differ by the imagers' FOV ratio and baseline.
+        """
+        if self.rs_align is None:
+            return frame
+        return self.rs_align.process(frame)
+
     def read_depth(self, timeout_ms: int = 200) -> NDArray[Any]:
         """
         Reads a single frame (depth) synchronously from the camera.
@@ -349,7 +368,7 @@ class RealSenseCamera(Camera):
         if not ret or frame is None:
             raise RuntimeError(f"{self} read_depth failed (status={ret}).")
 
-        depth_frame = frame.get_depth_frame()
+        depth_frame = self._aligned_frameset(frame).get_depth_frame()
         depth_map = np.asanyarray(depth_frame.get_data())
 
         depth_map_processed = self._postprocess_image(depth_map, depth_frame=True)
@@ -483,6 +502,9 @@ class RealSenseCamera(Camera):
                 ret, frame = self.rs_pipeline.try_wait_for_frames(timeout_ms=500)
                 if not ret or frame is None:
                     raise RuntimeError(f"{self} read failed (status={ret}).")
+
+                if self.use_depth:
+                    frame = self._aligned_frameset(frame)
 
                 color_frame = frame.get_color_frame()
                 color_image_raw = np.asanyarray(color_frame.get_data())
@@ -650,5 +672,6 @@ class RealSenseCamera(Camera):
             self.rs_pipeline.stop()
             self.rs_pipeline = None
             self.rs_profile = None
+            self.rs_align = None
 
         logger.info(f"{self} disconnected.")

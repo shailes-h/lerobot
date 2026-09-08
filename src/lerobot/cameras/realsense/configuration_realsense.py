@@ -43,12 +43,22 @@ class RealSenseCameraConfig(CameraConfig):
         serial_number_or_name: Unique serial number or human-readable name to identify the camera.
         color_mode: Color mode for image output (RGB or BGR). Defaults to RGB.
         use_depth: Whether to enable depth stream. Defaults to False.
+        align_depth_to_color: Whether to reproject the depth stream into the color
+            camera's frame (``rs.align``). Defaults to True. Without it, depth is
+            returned in the depth imager's own frame, which on a D435 is a ~90 deg
+            horizontal FOV against the color camera's ~70 deg, plus a ~15 mm
+            baseline -- so depth pixel (u, v) is NOT color pixel (u, v), and any
+            RGB-D use (point clouds, depth lookups at image coordinates) is wrong.
+            Set False only if you deliberately want the raw depth-imager frame.
         rotation: Image rotation setting (0°, 90°, 180°, or 270°). Defaults to no rotation.
         warmup_s: Time reading frames before returning from connect (in seconds)
 
     Note:
         - Either name or serial_number must be specified.
         - Depth stream configuration (if enabled) will use the same FPS as the color stream.
+        - When `align_depth_to_color` is set, the returned depth map is in the color
+          camera's frame and carries the color intrinsics, matching what `rs.align`
+          produces.
         - The actual resolution and FPS may be adjusted by the camera to the nearest supported mode.
         - For `fps`, `width` and `height`, either all of them need to be set, or none of them.
     """
@@ -56,6 +66,7 @@ class RealSenseCameraConfig(CameraConfig):
     serial_number_or_name: str
     color_mode: ColorMode = ColorMode.RGB
     use_depth: bool = False
+    align_depth_to_color: bool = True
     rotation: Cv2Rotation = Cv2Rotation.NO_ROTATION
     warmup_s: int = 1
 
