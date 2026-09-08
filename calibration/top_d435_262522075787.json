@@ -1,0 +1,62 @@
+{
+  "device": "Intel RealSense D435",
+  "serial": "262522075787",
+  "firmware": "5.15.1.55",
+  "resolution": [
+    1280,
+    720
+  ],
+  "fps": 15,
+  "note": "Factory calibration read from the device. Recorded depth is NOT aligned to color (no rs.align at capture time); use depth_to_color to align.",
+  "color_intrinsics": {
+    "fx": 907.9041748046875,
+    "fy": 905.8643798828125,
+    "cx": 643.4105834960938,
+    "cy": 373.9054870605469,
+    "width": 1280,
+    "height": 720,
+    "model": "distortion.inverse_brown_conrady",
+    "coeffs": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ]
+  },
+  "depth_intrinsics": {
+    "fx": 641.6383056640625,
+    "fy": 641.6383056640625,
+    "cx": 651.6322021484375,
+    "cy": 363.86865234375,
+    "width": 1280,
+    "height": 720,
+    "model": "distortion.brown_conrady",
+    "coeffs": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ]
+  },
+  "depth_to_color": {
+    "rotation_row_major": [
+      0.999993622303009,
+      -0.003449987852945924,
+      -0.0008951523341238499,
+      0.00345106003805995,
+      0.9999933242797852,
+      0.0011990451021119952,
+      0.0008910096948966384,
+      -0.001202126732096076,
+      0.9999988675117493
+    ],
+    "translation_m": [
+      0.014990312047302723,
+      0.00026134945801459253,
+      0.00025264464784413576
+    ]
+  },
+  "depth_scale_m": 0.0010000000474974513
+}
