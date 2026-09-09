@@ -220,16 +220,16 @@ class EvalGamPolicyConfig:
     max_episodes: int = 50
     output_dir: str = "eval_logs"
     video_fps: float | None = None
-    # Camera calibration — intrinsics (guessed for 1280x720 RealSense)
-    intrinsic_fx: float = 896.0
-    intrinsic_fy: float = 896.0
-    intrinsic_cx: float = 640.0
-    intrinsic_cy: float = 360.0
+    # Camera calibration — correct intrinsics for aligned D435 (1280x720)
+    intrinsic_fx: float = 907.90
+    intrinsic_fy: float = 905.86
+    intrinsic_cx: float = 643.41
+    intrinsic_cy: float = 373.91
     # cam2base extrinsic — 12 floats, row-major 3x4 (rotation | translation)
     cam2base: tuple[float, ...] = (
-        -0.9894,  0.0612, -0.1321,  0.0089428,
-         0.1283,  0.7949, -0.5930, -0.0306607,
-         0.0687, -0.6036, -0.7943,  0.4099219,
+        -0.98940003,  0.06120000, -0.13210000,  0.00894280,
+         0.12830000,  0.79490000, -0.59299999, -0.04316070,
+         0.06870000, -0.60360003, -0.79430002,  0.41122191,
     )
 
 
@@ -600,6 +600,7 @@ def _run_episode(
             "clicks": clicks,
             "instruction": cfg.task,
             "reset": step == 0,  # seed CoTracker on first frame
+            "debug_viz": True,
         }
 
         t0 = time.perf_counter()
@@ -637,6 +638,17 @@ def _run_episode(
             f"episode={episode} step={step} round_trip_ms={dt_ms:.1f} "
             f"server_dt_ms={resp_data.get('dt_ms', float('nan')):.1f}{track_info}"
         )
+
+        # Save debug viz image if returned
+        debug_viz_b64 = resp_data.get("debug_viz")
+        if debug_viz_b64:
+            debug_dir = session.session_dir / "debug_viz" / f"episode_{episode:03d}"
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            viz_bytes = _b64.b64decode(debug_viz_b64)
+            viz_path = debug_dir / f"step_{step:05d}.jpg"
+            viz_path.write_bytes(viz_bytes)
+            if step == 0:
+                logging.info(f"Debug viz saving to {debug_dir}")
 
         n_exec = min(cfg.actions_per_chunk, len(actions))
         for i in range(n_exec):
