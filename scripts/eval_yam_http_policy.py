@@ -128,6 +128,12 @@ SIDES = ("left", "right")
 CAM_KEYS = ("top", "left", "right")
 VIDEO_TILE_WH = (320, 240)  # per-camera tile size in the composed mp4 frame
 
+# Chunk gate thresholds (see EvalYamHttpPolicyConfig.chunk_gate_enabled).
+CHUNK_GATE_NEAR_HOME_POS_M = 0.05
+CHUNK_GATE_NEAR_HOME_ANGLE_DEG = 10.0
+CHUNK_GATE_MIN_MOVE_POS_M = 0.02
+CHUNK_GATE_MIN_MOVE_ANGLE_DEG = 5.0
+
 
 @dataclass
 class DatasetRecordConfig:
@@ -181,6 +187,41 @@ class EvalYamHttpPolicyConfig:
     reset_joint_pos: tuple[float, float, float, float, float, float] = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
     reset_duration_s: float = 4.0
     reset_hz: float = 20.0
+    # If a predicted action's pose for an arm is already within these thresholds of that
+    # arm's home pose (the EEF pose `reset_joint_pos` FKs to, gripper open), snap that arm's
+    # target pose to EXACTLY the home pose instead of IK-ing to the model's (likely just
+    # noisy) near-home output. The policy's own gripper command is left untouched either way.
+    #
+    # DEFAULT OFF -- confirmed on real hardware to cause a visible snap/jump, not a smooth
+    # settle: this is a hard on/off threshold, so frame-to-frame the commanded pose can flip
+    # between "exact home" (inside the threshold) and the model's actual, slightly-off
+    # prediction (just outside it) -- IK solved independently for those two nearby-but-
+    # distinct targets can land on meaningfully different joint angles. Right after `_home()`
+    # is exactly when the model's predictions are naturally closest to home, so this fires
+    # right when it's most visible. Needs a continuous blend (e.g. lerp the pose toward home
+    # as distance shrinks) instead of a hard cutoff before it's safe to enable.
+    home_snap_enabled: bool = False
+    home_snap_pos_threshold_m: float = 0.01
+    home_snap_angle_threshold_deg: float = 3.0
+    # HARDWARE SAFETY RAIL: hard-clamps every commanded joint target to at most this much
+    # (radians) away from the PREVIOUSLY COMMANDED target for that joint, every control
+    # step, regardless of where the target came from (IK on a policy chunk, a bad IK branch,
+    # a home-snap/discontinuity like the one that tripped a motor fault on 2026-09-09, a
+    # garbage/stale server response). This is independent of and in addition to
+    # `--robot.left/right_arm_max_relative_target` (which clips against the arm's live
+    # feedback position instead of the last command, and is None/off unless you set it) --
+    # defense in depth, not a replacement. 0.15 rad (~8.6 deg) per step at the default 30 Hz
+    # control rate is a hard cap of ~258 deg/s; tune down if that's still enough to jolt your
+    # payload. Applies in both the policy loop and `_slow_reset`/homing.
+    max_joint_step_rad: float = 0.15
+    # Same idea for the gripper (0-1 range) -- much less safety-critical, but a max_joint_
+    # step_rad-only rail sending a full-speed gripper snap alongside slowed joints is still a
+    # smaller version of the same bug.
+    max_gripper_step: float = 0.15
+    # If an arm is near home AND the chunk's last row barely moves it (see CHUNK_GATE_*
+    # constants), hold that arm at rest instead of executing the chunk -- filters idle noise
+    # without touching mid-task motion.
+    chunk_gate_enabled: bool = True
     # Session bookkeeping.
     max_episodes: int = 50
     output_dir: str = "eval_logs"
@@ -213,14 +254,23 @@ def _slow_reset(
     target_joint_pos: np.ndarray,
     duration_s: float,
     hz: float,
+    max_joint_step_rad: float,
+    max_gripper_step: float,
 ) -> None:
     """Linearly interpolate both arms' 6 joints from their current position to
     `target_joint_pos` over `duration_s`, in joint space (no IK needed). The gripper is
     interpolated open (1.0 -- see `bi_yam_leader.py`'s "not pressed = open (1)") over the
-    same window, so every reset ends with both grippers open."""
+    same window, so every reset ends with both grippers open.
+
+    `max_joint_step_rad`/`max_gripper_step` are the same hardware safety rail applied in the
+    policy loop (see `EvalYamHttpPolicyConfig.max_joint_step_rad`) -- normally a no-op here
+    since the interpolation's own per-step delta is already small and known ahead of time,
+    but it's cheap insurance against a misconfigured `duration_s`/`hz` producing a jump."""
     obs = robot.get_observation()
     start = {side: _current_arm_joint_pos(obs, side) for side in SIDES}
     gripper_start = {side: obs[f"{side}_gripper.pos"] for side in SIDES}
+    prev_q = dict(start)
+    prev_gripper = dict(gripper_start)
 
     n_steps = max(1, int(duration_s * hz))
     period_s = 1.0 / hz
@@ -230,9 +280,15 @@ def _slow_reset(
         action: dict[str, float] = {}
         for side in SIDES:
             q = (1 - alpha) * start[side] + alpha * target_joint_pos
+            q = _clamp_step(prev_q[side], q, max_joint_step_rad)
+            prev_q[side] = q
             for j, val in enumerate(q):
                 action[f"{side}_joint_{j}.pos"] = float(val)
-            action[f"{side}_gripper.pos"] = float((1 - alpha) * gripper_start[side] + alpha * 1.0)
+
+            gripper = (1 - alpha) * gripper_start[side] + alpha * 1.0
+            gripper = float(np.clip(gripper, prev_gripper[side] - max_gripper_step, prev_gripper[side] + max_gripper_step))
+            prev_gripper[side] = gripper
+            action[f"{side}_gripper.pos"] = gripper
 
         robot_obs = robot.get_observation()
         processed_action = robot_action_processor((action, robot_obs))
@@ -244,6 +300,39 @@ def _action_row_to_pose(row: np.ndarray, side_idx: int) -> dict[str, float]:
     """One arm's 8 values out of a flat 16-D action row -- `EEF_POSE_NAMES_WITH_GRIPPER` order."""
     values = row[side_idx * 8 : side_idx * 8 + 8]
     return dict(zip(EEF_POSE_NAMES_WITH_GRIPPER, (float(v) for v in values)))
+
+
+def _pose_distance(pose_a: dict[str, float], pose_b: dict[str, float]) -> tuple[float, float]:
+    """(position distance in meters, orientation angle in radians) between two poses.
+    Orientation compares via the quaternion dot product -- `abs()` handles the q/-q double
+    cover -- rather than subtracting components, which isn't a meaningful rotation metric."""
+    pos_dist = float(
+        np.linalg.norm([pose_a["x"] - pose_b["x"], pose_a["y"] - pose_b["y"], pose_a["z"] - pose_b["z"]])
+    )
+    qa = np.array([pose_a["qw"], pose_a["qx"], pose_a["qy"], pose_a["qz"]])
+    qb = np.array([pose_b["qw"], pose_b["qx"], pose_b["qy"], pose_b["qz"]])
+    dot = float(np.clip(abs(np.dot(qa, qb)), -1.0, 1.0))
+    angle_rad = 2.0 * np.arccos(dot)
+    return pos_dist, angle_rad
+
+
+def _snap_to_home_if_close(
+    target_pose: dict[str, float], home_pose: dict[str, float], pos_threshold_m: float, angle_threshold_rad: float
+) -> dict[str, float]:
+    """If `target_pose` is already within threshold of `home_pose`, return `home_pose`
+    exactly (keeping `target_pose`'s own gripper command) instead of the model's raw,
+    possibly-jittery near-home output. Otherwise returns `target_pose` unchanged."""
+    pos_dist, angle_rad = _pose_distance(target_pose, home_pose)
+    if pos_dist < pos_threshold_m and angle_rad < angle_threshold_rad:
+        return {**home_pose, "gripper": target_pose["gripper"]}
+    return target_pose
+
+
+def _clamp_step(prev: np.ndarray, target: np.ndarray, max_delta: float) -> np.ndarray:
+    """Hard per-element rate limit: `target` clipped to within `max_delta` of `prev`. The
+    hardware safety rail against any single-step jump -- see `max_joint_step_rad`'s docs on
+    `EvalYamHttpPolicyConfig` for why this exists independent of the IK/pose layer above."""
+    return np.clip(target, prev - max_delta, prev + max_delta)
 
 
 def _augment_action_for_dataset(action: dict[str, float], row: np.ndarray, obs: dict) -> None:
@@ -523,6 +612,8 @@ def _home(cfg: EvalYamHttpPolicyConfig, robot: BiYamFollower, robot_action_proce
         np.asarray(cfg.reset_joint_pos, dtype=np.float32),
         cfg.reset_duration_s,
         cfg.reset_hz,
+        cfg.max_joint_step_rad,
+        cfg.max_gripper_step,
     )
 
 
@@ -576,11 +667,22 @@ def _run_episode(
     _print_controls("running")
 
     init_q = {side: _current_arm_joint_pos(obs, side) for side in SIDES}
+    prev_gripper = {side: obs[f"{side}_gripper.pos"] for side in SIDES}
     period_s = 1.0 / cfg.control_hz
     t_start = time.perf_counter()
     step = 0
     outcome: str | None = None
     time_capped = False
+
+    # Home pose per arm, used by home-snap and the chunk gate.
+    home_poses = None
+    angle_threshold_rad = 0.0
+    if cfg.home_snap_enabled or cfg.chunk_gate_enabled:
+        home_joint_pos = np.asarray(cfg.reset_joint_pos, dtype=np.float32)
+        home_poses = {
+            side: eef_pose_from_joint_pos(np.append(home_joint_pos, 1.0)) for side in SIDES
+        }
+        angle_threshold_rad = np.deg2rad(cfg.home_snap_angle_threshold_deg)
 
     while outcome is None:
         elapsed = time.perf_counter() - t_start
@@ -629,6 +731,23 @@ def _run_episode(
             f"quat_norm_dev={resp.get('quat_norm_dev', float('nan')):.2e}"
         )
 
+        # Hold an arm at rest this chunk if it's near home and barely moving (see
+        # chunk_gate_enabled).
+        chunk_move_enough = {side: True for side in SIDES}
+        if cfg.chunk_gate_enabled and home_poses is not None:
+            for side_idx, side in enumerate(SIDES):
+                current_pose = eef_pose_from_joint_pos(_current_arm_joint_pos_with_gripper(obs, side))
+                home_pos_dist, home_angle_rad = _pose_distance(current_pose, home_poses[side])
+                near_home = home_pos_dist < CHUNK_GATE_NEAR_HOME_POS_M and home_angle_rad < np.deg2rad(
+                    CHUNK_GATE_NEAR_HOME_ANGLE_DEG
+                )
+                if not near_home:
+                    continue
+                pos_dist, angle_rad = _pose_distance(current_pose, _action_row_to_pose(actions[-1], side_idx))
+                chunk_move_enough[side] = pos_dist >= CHUNK_GATE_MIN_MOVE_POS_M or angle_rad >= np.deg2rad(
+                    CHUNK_GATE_MIN_MOVE_ANGLE_DEG
+                )
+
         n_exec = min(cfg.actions_per_chunk, len(actions))
         for i in range(n_exec):
             row_start = time.perf_counter()
@@ -640,17 +759,45 @@ def _run_episode(
 
             action: dict[str, float] = {}
             for side_idx, side in enumerate(SIDES):
+                if not chunk_move_enough[side]:
+                    # Hold: re-send the last commanded target instead of this row's prediction.
+                    for j, q in enumerate(init_q[side]):
+                        action[f"{side}_joint_{j}.pos"] = float(q)
+                    action[f"{side}_gripper.pos"] = prev_gripper[side]
+                    continue
+
                 target_pose = _action_row_to_pose(actions[i], side_idx)
+                if cfg.home_snap_enabled and home_poses is not None:
+                    target_pose = _snap_to_home_if_close(
+                        target_pose, home_poses[side], cfg.home_snap_pos_threshold_m, angle_threshold_rad
+                    )
                 gripper_val = target_pose["gripper"]
 
                 success, q6 = ik_from_eef_pose(target_pose, init_q[side])
                 if not success:
                     logging.warning(f"episode={episode} step={step} row={i} {side}: IK did not converge")
+
+                # HARDWARE SAFETY RAIL -- see `max_joint_step_rad`'s docstring. Clamp against
+                # the previously COMMANDED joint target (init_q[side]), not the raw IK output,
+                # regardless of source (a bad IK branch, a discontinuity, a stale/garbage
+                # response) -- never send a jump bigger than this in one control step.
+                q6_step = np.max(np.abs(q6 - init_q[side]))
+                q6 = _clamp_step(init_q[side], q6, cfg.max_joint_step_rad)
+                if q6_step > cfg.max_joint_step_rad:
+                    logging.warning(
+                        f"episode={episode} step={step} row={i} {side}: joint step {q6_step:.3f} rad "
+                        f"clamped to {cfg.max_joint_step_rad} rad/step"
+                    )
                 init_q[side] = q6
+
+                gripper_val = float(
+                    np.clip(gripper_val, prev_gripper[side] - cfg.max_gripper_step, prev_gripper[side] + cfg.max_gripper_step)
+                )
+                prev_gripper[side] = gripper_val
 
                 for j, q in enumerate(q6):
                     action[f"{side}_joint_{j}.pos"] = float(q)
-                action[f"{side}_gripper.pos"] = float(gripper_val)
+                action[f"{side}_gripper.pos"] = gripper_val
 
             robot_obs = robot.get_observation()
             recorder.write(robot_obs)
