@@ -18,12 +18,11 @@ CLICKS — FIRST-FRAME INTERACTIVE ANNOTATION
 ===============================================================================
 
 At the start of each episode, a matplotlib window pops up showing the first
-camera frame. The user clicks 4 points, one per slot:
+camera frame. The user clicks 3 points, one per slot:
 
     1. pick_1   — where to pick the first object
-    2. place_1  — where to place it
-    3. pick_2   — where to pick the second object
-    4. place_2  — where to place it
+    2. pick_2   — where to pick the second object
+    3. place_1  — where to place both objects
 
 These clicks are sent to the server on every subsequent frame of that episode.
 When the server has --track-clicks enabled, CoTracker3 online tracks these
@@ -93,8 +92,8 @@ from lerobot.utils.utils import init_logging, log_say
 SIDES = ("left", "right")
 CAM_KEY = "top"  # single head camera
 
-SLOT_NAMES = ["pick_1", "place_1", "pick_2", "place_2"]
-SLOT_COLORS = [(255, 0, 0), (0, 200, 0), (0, 0, 255), (255, 165, 0)]  # red, green, blue, orange
+SLOT_NAMES = ["pick_1", "pick_2", "place_1"]
+SLOT_COLORS = [(255, 0, 0), (0, 0, 255), (0, 200, 0)]  # red, blue, green
 
 VIDEO_TILE_WH = (640, 360)
 
@@ -523,7 +522,7 @@ def _run_episode(
 
     # ---- Collect clicks for this episode ----
     rgb_first = np.asarray(obs[CAM_KEY])
-    print(f"[eval] Annotate clicks for episode {episode} (4 clicks: pick_1, place_1, pick_2, place_2)")
+    print(f"[eval] Annotate clicks for episode {episode} (3 clicks: pick_1, pick_2, place_1)")
     clicks = _collect_clicks(rgb_first, SLOT_NAMES, SLOT_COLORS)
 
     # Reset server-side CoTracker state for the new episode
@@ -552,6 +551,7 @@ def _run_episode(
     outcome: str | None = None
     time_capped = False
     cur_state = _state14_from_obs(obs)
+    intermediate_frames: list[str] = []  # JPEG-b64 frames for CoTracker dense tracking
 
     while outcome is None:
         elapsed = time.perf_counter() - t_start
@@ -602,6 +602,10 @@ def _run_episode(
             "reset": step == 0,  # seed CoTracker on first frame
             "debug_viz": True,
         }
+        # Send intermediate frames so server-side CoTracker sees dense video
+        if intermediate_frames:
+            payload["extra_frames_jpg"] = intermediate_frames
+        intermediate_frames = []  # reset for next chunk
 
         t0 = time.perf_counter()
         body = json_numpy.dumps(payload)
@@ -672,6 +676,14 @@ def _run_episode(
             recorder.write(robot_obs)
             prev_state = cur_state
             cur_state = _state14_from_obs(robot_obs)
+
+            # Capture intermediate frame for CoTracker dense tracking
+            inter_rgb = np.asarray(robot_obs[CAM_KEY])
+            _, inter_jpg = cv2.imencode(
+                ".jpg", cv2.cvtColor(inter_rgb, cv2.COLOR_RGB2BGR),
+                [cv2.IMWRITE_JPEG_QUALITY, 60],  # lower quality for intermediate frames
+            )
+            intermediate_frames.append(_b64.b64encode(inter_jpg.tobytes()).decode("ascii"))
 
             if dataset is not None:
                 observation_frame = build_dataset_frame(
