@@ -1,3 +1,18 @@
 [submodule "i2rt"]
 	path = i2rt
 	url = https://github.com/i2rt-robotics/i2rt.git
+[submodule "third_party/Isaac-GR00T"]
+	path = third_party/Isaac-GR00T
+	url = https://github.com/NVIDIA/Isaac-GR00T.git
+[submodule "third_party/GalaxeaVLA"]
+	path = third_party/GalaxeaVLA
+	url = https://github.com/OpenGalaxea/GalaxeaVLA.git
+[submodule "third_party/molmoact2"]
+	path = third_party/molmoact2
+	url = https://github.com/allenai/molmoact2.git
+[submodule "third_party/openpi"]
+	path = third_party/openpi
+	url = https://github.com/Physical-Intelligence/openpi.git
+[submodule "third_party/lingbot-vla-v2"]
+	path = third_party/lingbot-vla-v2
+	url = https://github.com/robbyant/lingbot-vla-v2
