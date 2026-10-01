@@ -24,10 +24,12 @@ joint angles** (state in, action out), in exactly the follower's own key order:
 
     [left_joint_0..5.pos, left_gripper.pos, right_joint_0..5.pos, right_gripper.pos]
 
-So there is no FK/IK anywhere in this script: the state sent to the server is read straight off
-the follower's observation, and each returned action row is split into a 6-DoF arm target plus a
-gripper value per side and sent to the robot as-is (through the same hardware safety rails --
-`max_joint_step_rad` / `max_gripper_step` clamps -- as the EEF client).
+There is no FK/IK anywhere in the control loop itself: the state sent to the server is read
+straight off the follower's observation, and each returned action row is split into a 6-DoF
+arm target plus a gripper value per side and sent to the robot as-is (through the same
+hardware safety rails -- `max_joint_step_rad` / `max_gripper_step` clamps -- as the EEF
+client). FK is only ever used for `--record_dataset=true` recordings, to fill in the
+`*_eef.*`/`*_eef_delta.*` dataset columns -- see `_augment_action_with_eef` below.
 
 Same interactive multi-episode session (b/s/f/n/r/z on stdin), same per-episode mp4s + session
 log + optional `--record_dataset=true` LeRobotDataset recording as `eval_yam_http_policy.py` --
@@ -39,19 +41,25 @@ per-joint angle deviation instead of an EEF pose distance) and default OFF, matc
 client's own default-off home_snap; turn them on if you want the same near-home
 idle-noise/snap behavior here.
 
-Pass `--robot.record_eef_pose=false`: `BiYamFollowerConfig` defaults to `True` (it drives the
-EEF client's dataset schema too), which makes `BiYamFollower` populate `*_eef.*`
-observation/action dataset columns via FK on every tick and makes `--record_dataset=true`
-require this client to also supply `left_eef.x` etc. in every action dict -- this client never
-computes those (no FK/IK anywhere here), so leaving the default on will crash
-`build_dataset_frame` with a `KeyError` the first time an episode tries to write a frame.
+`BiYamFollowerConfig.record_eef_pose` defaults to `True` (same as the EEF client), which makes
+`BiYamFollower` populate `observation.state_eef_absolute` via FK on every tick. With
+`--record_dataset=true`, this script's own `_augment_action_with_eef` fills in the matching
+`action_eef_absolute`/`action_eef_delta` columns too (FK on the commanded joint target, same
+`eef_pose_delta` formula `BiYamLeader.augment_action_with_observation` uses during teleop) --
+so a recorded dataset lands in the exact same
+`observation.state_eef_absolute` / `action_eef_absolute` / `action_eef_delta` /
+`action_joint_angles` / `observation.state_joint_angles` schema as the teleop-collected
+datasets (dustpan/cups/drawer/microwave), and `scripts/encode_pending_videos.py` alone is
+enough afterward -- no separate schema conversion needed. Pass `--robot.record_eef_pose=false`
+if you'd rather record the older plain `action`/`observation.state` (14-D joint only) schema;
+the control loop itself never touches `*_eef.*` either way (it's dataset-only, not sent to the
+server/robot).
 
 Usage:
 
 ```shell
 python scripts/eval_yam_joint_policy.py \
   --robot.left_arm_port=1235 --robot.right_arm_port=1234 \
-  --robot.record_eef_pose=false \
   --robot.cameras='{
 right: {"type": "intelrealsense", "serial_number_or_name": "260322275072", "width": 640, "height": 480, "fps": 30},
 left: {"type": "intelrealsense", "serial_number_or_name": "260322271881", "width": 640, "height": 480, "fps": 30},
@@ -90,6 +98,11 @@ from lerobot.datasets.utils import build_dataset_frame, combine_feature_dicts
 from lerobot.processor import make_default_processors
 from lerobot.robots.bi_yam_follower.bi_yam_follower import BiYamFollower
 from lerobot.robots.bi_yam_follower.config_bi_yam_follower import BiYamFollowerConfig
+from lerobot.robots.bi_yam_follower.eef_kinematics import (
+    EEF_POSE_NAMES_WITH_GRIPPER,
+    eef_pose_delta,
+    eef_pose_from_joint_pos,
+)
 from lerobot.utils.constants import ACTION, OBS_STR
 from lerobot.utils.robot_utils import busy_wait
 from lerobot.utils.utils import init_logging, log_say
@@ -278,6 +291,32 @@ def _clamp_step(prev: np.ndarray, target: np.ndarray, max_delta: float) -> np.nd
     return np.clip(target, prev - max_delta, prev + max_delta)
 
 
+def _augment_action_with_eef(action: dict[str, float], robot_obs: dict) -> dict[str, float]:
+    """If `--robot.record_eef_pose=true` (the default), `robot_obs` already carries
+    `{side}_eef.*` (FK on the follower's own joint positions, done by `BiYamFollower.
+    get_observation()`). Mirror what `BiYamLeader.get_action()` +
+    `augment_action_with_observation()` do during teleop: FK the commanded joint target into
+    `action[f"{side}_eef.{axis}"]` (-> `action_eef_absolute`), then
+    `eef_pose_delta(target, current)` into `action[f"{side}_eef_delta.{axis}"]` (->
+    `action_eef_delta`) -- so `--record_dataset=true` recordings get the same EEF columns a
+    teleop-collected dataset has. No-op (returns `action` unchanged) when `record_eef_pose`
+    is off, same guard as `augment_action_with_observation`."""
+    for side in SIDES:
+        if f"{side}_eef.x" not in robot_obs:
+            continue
+        q6 = np.array([action[f"{side}_joint_{i}.pos"] for i in range(6)])
+        gripper = action[f"{side}_gripper.pos"]
+        target_pose = eef_pose_from_joint_pos(np.append(q6, gripper))
+        for axis in EEF_POSE_NAMES_WITH_GRIPPER:
+            action[f"{side}_eef.{axis}"] = target_pose[axis]
+
+        current_pose = {axis: robot_obs[f"{side}_eef.{axis}"] for axis in EEF_POSE_NAMES_WITH_GRIPPER}
+        delta = eef_pose_delta(target_pose, current_pose)
+        for axis in EEF_POSE_NAMES_WITH_GRIPPER:
+            action[f"{side}_eef_delta.{axis}"] = delta[axis]
+    return action
+
+
 def _build_dataset_record_config(cfg: EvalYamJointPolicyConfig, timestamp: str) -> DatasetRecordConfig:
     """Only called when `--record_dataset=true`. Places the dataset inside this run's own
     `<output_dir>/<timestamp>/` session folder (alongside `videos/`, `log.jsonl`,
@@ -352,6 +391,69 @@ def _request_with_retries(fn, retries: int = 5, backoff_s: float = 2.0):
             logging.warning(f"request attempt {attempt}/{retries} failed: {e!r}; retrying in {backoff_s}s")
             time.sleep(backoff_s)
     raise RuntimeError(f"request failed after {retries} attempts") from last_exc
+
+
+def _request_next_chunk(
+    requests_module,
+    server_url: str,
+    payload: dict,
+    robot: BiYamFollower,
+    robot_action_processor,
+    recorder: "EpisodeRecorder",
+    dataset: LeRobotDataset | None,
+    robot_observation_processor,
+    task: str,
+    init_q: dict[str, np.ndarray],
+    prev_gripper: dict[str, float],
+    period_s: float,
+) -> tuple[dict, float]:
+    """POST for the next action chunk on a background thread, and while waiting for the
+    server's response keep sampling+recording the robot at the control period instead of
+    silently losing those frames: the round-trip (inference + network) latency between chunks
+    otherwise leaves a real-time gap the dataset never captures. The robot is re-commanded to
+    hold its last applied joint targets (`init_q`/`prev_gripper`) for the duration, since that's
+    what it's already doing and there's no new policy output yet to act on."""
+    result: dict = {}
+
+    def _do_request() -> None:
+        result["resp"] = _request_with_retries(
+            lambda: requests_module.post(
+                server_url, json=payload, headers={"ngrok-skip-browser-warning": "1"}, timeout=60
+            ).json()
+        )
+
+    t0 = time.perf_counter()
+    thread = threading.Thread(target=_do_request, daemon=True)
+    thread.start()
+
+    hold_action: dict[str, float] = {}
+    for side in SIDES:
+        for j, q in enumerate(init_q[side]):
+            hold_action[f"{side}_joint_{j}.pos"] = float(q)
+        hold_action[f"{side}_gripper.pos"] = prev_gripper[side]
+
+    while thread.is_alive():
+        row_start = time.perf_counter()
+        hold_obs = robot.get_observation()
+        recorder.write(hold_obs)
+
+        processed_action = robot_action_processor((hold_action, hold_obs))
+        robot.send_action(processed_action)
+
+        if dataset is not None:
+            observation_frame = build_dataset_frame(
+                dataset.features, robot_observation_processor(hold_obs), prefix=OBS_STR
+            )
+            action_frame = build_dataset_frame(
+                dataset.features, _augment_action_with_eef(dict(hold_action), hold_obs), prefix=ACTION
+            )
+            dataset.add_frame({**observation_frame, **action_frame, "task": task})
+
+        busy_wait(period_s - (time.perf_counter() - row_start))
+
+    thread.join()
+    dt_ms = (time.perf_counter() - t0) * 1000.0
+    return result["resp"], dt_ms
 
 
 # ---------------------------------------------------------------------------
@@ -631,18 +733,22 @@ def _run_episode(
         if cfg.num_steps is not None:
             payload["num_steps"] = cfg.num_steps
 
-        t0 = time.perf_counter()
-        resp = _request_with_retries(
-            lambda: requests.post(
-                cfg.server_url,
-                json=payload,
-                headers={"ngrok-skip-browser-warning": "1"},
-                timeout=60,
-            ).json()
+        resp, dt_ms = _request_next_chunk(
+            requests,
+            cfg.server_url,
+            payload,
+            robot,
+            robot_action_processor,
+            recorder,
+            dataset,
+            robot_observation_processor,
+            cfg.task,
+            init_q,
+            prev_gripper,
+            period_s,
         )
         if "error" in resp:
             raise RuntimeError(f"server returned an error: {resp['error']}")
-        dt_ms = (time.perf_counter() - t0) * 1000.0
 
         actions = np.asarray(resp["actions"], dtype=np.float32)  # (chunk_size, 14), ABSOLUTE joints
         logging.info(
@@ -715,7 +821,9 @@ def _run_episode(
                 observation_frame = build_dataset_frame(
                     dataset.features, robot_observation_processor(robot_obs), prefix=OBS_STR
                 )
-                action_frame = build_dataset_frame(dataset.features, action, prefix=ACTION)
+                action_frame = build_dataset_frame(
+                    dataset.features, _augment_action_with_eef(dict(action), robot_obs), prefix=ACTION
+                )
 
             processed_action = robot_action_processor((action, robot_obs))
             robot.send_action(processed_action)
