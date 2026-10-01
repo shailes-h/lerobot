@@ -621,6 +621,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         download_videos: bool = True,
         video_backend: str | None = None,
         batch_encoding_size: int = 1,
+        skip_video_encoding: bool = False,
     ):
         """
         2 modes are available for instantiating this class, depending on 2 different use cases:
@@ -733,6 +734,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 You can also use the 'pyav' decoder used by Torchvision, which used to be the default option, or 'video_reader' which is another decoder of Torchvision.
             batch_encoding_size (int, optional): Number of episodes to accumulate before batch encoding videos.
                 Set to 1 for immediate encoding (default), or higher for batched encoding. Defaults to 1.
+            skip_video_encoding (bool, optional): If True, never encode videos - not even the final
+                flush when recording stops. Raw per-frame images are left on disk for every episode,
+                to be encoded later. Defaults to False.
         """
         super().__init__()
         self.repo_id = repo_id
@@ -745,6 +749,10 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self.video_backend = video_backend if video_backend else get_safe_default_codec()
         self.delta_indices = None
         self.batch_encoding_size = batch_encoding_size
+        # If True, `save_episode()` and `VideoEncodingManager` never encode videos, not even
+        # the final flush when recording stops - raw per-frame images are left on disk for
+        # every episode. Encode them later with e.g. `scripts/encode_pending_videos.py`.
+        self.skip_video_encoding = skip_video_encoding
         self.episodes_since_last_encoding = 0
 
         # Unused attributes
@@ -1255,7 +1263,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
 
         ep_metadata = self._save_episode_data(episode_buffer)
         has_video_keys = len(self.meta.video_keys) > 0
-        use_batched_encoding = self.batch_encoding_size > 1
+        skip_encoding = getattr(self, "skip_video_encoding", False)
+        use_batched_encoding = self.batch_encoding_size > 1 or skip_encoding
 
         if has_video_keys and not use_batched_encoding:
             for video_key in self.meta.video_keys:
@@ -1264,7 +1273,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         # `meta.save_episode` need to be executed after encoding the videos
         self.meta.save_episode(episode_index, episode_length, episode_tasks, ep_stats, ep_metadata)
 
-        if has_video_keys and use_batched_encoding:
+        if has_video_keys and use_batched_encoding and not skip_encoding:
             # Check if we should trigger batch encoding
             self.episodes_since_last_encoding += 1
             if self.episodes_since_last_encoding == self.batch_encoding_size:
@@ -1272,6 +1281,10 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 end_ep = self.num_episodes
                 self._batch_save_episode_video(start_ep, end_ep)
                 self.episodes_since_last_encoding = 0
+        elif has_video_keys and skip_encoding:
+            # Leave this episode's raw frames on disk indefinitely - never counts toward a
+            # batch trigger, and VideoEncodingManager won't flush it on exit either.
+            self.episodes_since_last_encoding += 1
 
         if not episode_data:
             # Reset episode buffer and clean up temporary images (if not already deleted during video encoding)
@@ -1650,6 +1663,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         image_writer_threads: int = 0,
         video_backend: str | None = None,
         batch_encoding_size: int = 1,
+        skip_video_encoding: bool = False,
     ) -> "LeRobotDataset":
         """Create a LeRobot Dataset from scratch in order to record data."""
         obj = cls.__new__(cls)
@@ -1667,6 +1681,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         obj.tolerance_s = tolerance_s
         obj.image_writer = None
         obj.batch_encoding_size = batch_encoding_size
+        obj.skip_video_encoding = skip_video_encoding
         obj.episodes_since_last_encoding = 0
 
         if image_writer_processes or image_writer_threads:

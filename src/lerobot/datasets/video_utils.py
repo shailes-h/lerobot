@@ -629,7 +629,9 @@ class VideoEncodingManager:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         # Handle any remaining episodes that haven't been batch encoded
-        if self.dataset.episodes_since_last_encoding > 0:
+        if self.dataset.episodes_since_last_encoding > 0 and not getattr(
+            self.dataset, "skip_video_encoding", False
+        ):
             if exc_type is not None:
                 logging.info("Exception occurred. Encoding remaining episodes before exit...")
             else:

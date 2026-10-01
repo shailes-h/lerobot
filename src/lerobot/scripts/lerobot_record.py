@@ -166,6 +166,10 @@ class DatasetRecordConfig:
     # Number of episodes to record before batch encoding videos
     # Set to 1 for immediate encoding (default behavior), or higher for batched encoding
     video_encoding_batch_size: int = 1
+    # If True, never encode videos during this run - not even the final flush when recording
+    # stops. Raw per-frame images for every episode are left on disk under images/ so you can
+    # encode them later, e.g. with `python scripts/encode_pending_videos.py --repo-id ... --root ...`.
+    skip_video_encoding: bool = False
     # Rename map for the observation to override the image and state keys
     rename_map: dict[str, str] = field(default_factory=dict)
 
@@ -428,6 +432,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             cfg.dataset.repo_id,
             root=cfg.dataset.root,
             batch_encoding_size=cfg.dataset.video_encoding_batch_size,
+            skip_video_encoding=cfg.dataset.skip_video_encoding,
         )
 
         if hasattr(robot, "cameras") and len(robot.cameras) > 0:
@@ -449,6 +454,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             image_writer_processes=cfg.dataset.num_image_writer_processes,
             image_writer_threads=cfg.dataset.num_image_writer_threads_per_camera * len(robot.cameras),
             batch_encoding_size=cfg.dataset.video_encoding_batch_size,
+            skip_video_encoding=cfg.dataset.skip_video_encoding,
         )
 
     # Load pretrained policy
