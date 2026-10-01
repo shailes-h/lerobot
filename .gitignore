@@ -178,3 +178,11 @@ outputs/
 *.xml
 *.part
 internal/
+datasets/*
+third_party/*
+
+# RoboColosseum eval: model venvs that can't live inside their submodule, session artifacts, and
+# dev-only notes -- see ROBOCOLOSSEUM_EVAL.md for the runbook.
+/envs/
+/eval_logs/
+/EVAL_LOCAL_ROBOCOLOSSEUM.md

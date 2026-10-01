@@ -19,7 +19,7 @@ G0.5, MolmoAct2, pi0.5, LingBot-VLA v2 (see EVAL_LOCAL_ROBOCOLOSSEUM.md).
 
 Exposes the SAME json_numpy REST `/act` contract for every model (`GET /act` health check,
 `POST /act` observation -> action chunk), so `scripts/eval_yam_joint_policy.py` never needs to
-change: only `--policy` and `--ckpt_path` change between runs.
+change: only `--policy` and `--task` (or `--ckpt_path`) change between runs.
 
     GET  /act  -> {"state_dim": 14, "action_dim": 14, "camera_keys": ["top", "left", "right"]}
     POST /act  body: {"top", "left", "right": HxWx3 uint8 RGB, "instruction": str,
@@ -37,30 +37,32 @@ requires any backend's dependencies to be installed. You still run this script i
 model's own env (uv/conda per the table in section 4 of the guide); this file only removes the
 need for 5 separate hand-rolled server scripts with 5 different client protocols.
 
+`--ckpt_path` is either a local directory or an HF reference
+`hf://<org>/<repo>[/<subfolder>][@<revision>]` (a `https://huggingface.co/<org>/<repo>/tree/<rev>/<subfolder>`
+URL works too). HF references are fetched with `snapshot_download` into the standard HF cache
+(`$HF_HOME`, default `~/.cache/huggingface`) and loaded from there -- every training-time config a
+backend needs ships inside that checkpoint folder, so nothing is read from or written to the
+submodules.
+
 Usage (run ONE model at a time; stop the previous server before starting the next so its VRAM
-is freed -- see guide section 4):
+is freed):
 
 ```shell
-# GR00T N1.7
-python scripts/rc_serve_policy.py --policy=gr00t --ckpt_path=ckpts/gr00t --port=8000
+# <model>/<task> from --hf_repo (default RoboColosseum/BimanualYAM-models)
+python scripts/rc_serve_policy.py --policy=gr00t --task=dustpan
+python scripts/rc_serve_policy.py --policy=g05 --task=dustpan --hf_repo=RoboColosseum/BimanualYAM-models
 
-# G0.5
-python scripts/rc_serve_policy.py --policy=g05 --ckpt_path=ckpts/g05/model.pt --port=8000
-
-# MolmoAct2
-python scripts/rc_serve_policy.py --policy=molmoact2 --ckpt_path=ckpts/molmoact2 --port=8000
-
-# pi0.5
-python scripts/rc_serve_policy.py --policy=pi05 --ckpt_path=ckpts/pi05 --port=8000
-
-# LingBot-VLA v2
-python scripts/rc_serve_policy.py --policy=lingbot --ckpt_path=ckpts/lingbot-vla-v2 --port=8000
+# any other checkpoint
+python scripts/rc_serve_policy.py --policy=molmoact2 --ckpt_path=hf://allenai/MolmoAct2-BimanualYAM --norm_tag=yam_dual_molmoact2
 ```
 
 Then point the client at it: `--server_url=http://localhost:8000/act`.
 """
 
 import argparse
+import hashlib
+import importlib.util
+import os
 import sys
 import time
 from pathlib import Path
@@ -70,6 +72,8 @@ import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 THIRD_PARTY = REPO_ROOT / "third_party"
+# Keeps backend imports from writing __pycache__/ into the submodules (not all of them ignore it).
+sys.pycache_prefix = str(Path.home() / ".cache" / "rc_serve_policy" / "pycache")
 
 CAMERA_KEYS = ("top", "left", "right")
 STATE_DIM = 14
@@ -102,6 +106,46 @@ def _add_to_path(*paths: Path) -> None:
             sys.path.insert(0, p_str)
 
 
+_HF_URL_PREFIXES = ("hf://", "https://huggingface.co/", "http://huggingface.co/")
+
+
+def _hf_repo_files(repo_id: str, allow_patterns: list[str] | None = None, revision: str | None = None) -> Path:
+    if importlib.util.find_spec("hf_transfer") is not None:
+        os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
+    from huggingface_hub import snapshot_download
+
+    return Path(snapshot_download(repo_id, revision=revision, allow_patterns=allow_patterns))
+
+
+def _hf_snapshot(repo_id: str, subfolder: str = "", revision: str | None = None) -> Path:
+    path = _hf_repo_files(repo_id, [f"{subfolder}/*"] if subfolder else None, revision) / subfolder
+    if not path.is_dir():
+        raise FileNotFoundError(f"{subfolder!r} not found in {repo_id}@{revision or 'main'}")
+    return path
+
+
+def resolve_ckpt(ref: str) -> Path:
+    """Local dir -> itself. HF reference -> its snapshot dir inside the HF cache (see module docstring)."""
+    local = Path(ref).expanduser()
+    if local.exists():
+        return local.absolute()
+
+    spec = ref
+    for prefix in _HF_URL_PREFIXES:
+        if spec.startswith(prefix):
+            spec = spec[len(prefix) :]
+            break
+    spec, _, revision = spec.partition("@")
+    parts = [p for p in spec.split("/") if p]
+    if len(parts) < 2:
+        raise FileNotFoundError(f"{ref!r} is neither an existing local path nor an HF reference")
+    repo_id, rest = "/".join(parts[:2]), parts[2:]
+    if len(rest) >= 2 and rest[0] in ("tree", "blob"):
+        revision = revision or rest[1]
+        rest = rest[2:]
+    return _hf_snapshot(repo_id, "/".join(rest), revision or None)
+
+
 def _require_submodule(repo_dir: Path) -> None:
     if not repo_dir.exists() or not any(repo_dir.iterdir()):
         raise RuntimeError(
@@ -116,12 +160,9 @@ def _require_submodule(repo_dir: Path) -> None:
 
 def load_gr00t(ckpt_path: str, device: str) -> PolicyBackend:
     """`Gr00tPolicy` (see `gr00t/policy/gr00t_policy.py`) needs a `NEW_EMBODIMENT` modality
-    config registered for the YAM robot's 14-D joint state/action layout -- copy the two files
-    named in EVAL_LOCAL_ROBOCOLOSSEUM.md section 0 to `runs/configs/gr00t/` before running this
-    (`yam_config.py` registers the embodiment tag, `yam_modality.json` is the modality spec
-    used at fine-tuning time). `yam_config.py` registers `EmbodimentTag.NEW_EMBODIMENT` as a
-    module-level side effect on import (confirmed in section 7 of the guide), so importing it
-    with `runs/configs/gr00t/` on `sys.path` is enough -- no explicit call needed.
+    config registered for the YAM robot's 14-D joint state/action layout. The checkpoint folder
+    ships the `yam_config.py` it was trained with, which registers it as a module-level side
+    effect on import -- so putting the checkpoint dir on `sys.path` and importing it is enough.
 
     State/action are a 4-part dict (`PARTS = ["left_arm", "left_gripper", "right_arm",
     "right_gripper"]` in `yam_config.py`, each a sub-range of the flat 14-D vector), cameras
@@ -131,7 +172,7 @@ def load_gr00t(ckpt_path: str, device: str) -> PolicyBackend:
     (matches section 4: "converted back to absolute by the processor")."""
     repo_dir = THIRD_PARTY / "Isaac-GR00T"
     _require_submodule(repo_dir)
-    _add_to_path(repo_dir, REPO_ROOT / "runs" / "configs" / "gr00t")
+    _add_to_path(repo_dir, Path(ckpt_path))
 
     from gr00t.data.embodiment_tags import EmbodimentTag
     from gr00t.policy.gr00t_policy import Gr00tPolicy
@@ -184,7 +225,7 @@ def load_gr00t(ckpt_path: str, device: str) -> PolicyBackend:
 # ---------------------------------------------------------------------------
 
 
-def _load_g05_config_from_run_dir(run_dir: Path, ckpt_path: str):
+def _load_g05_config_from_run_dir(run_dir: Path, ckpt_path: str, hf_processor: Path):
     """Reimplements `g05.utils.checkpoint.ckpt_utils.load_config_from_run_dir`, with one fix
     applied to two fields: on this checkpoint's saved `.hydra/config.yaml`, both
     `model.tokenizer` (`${tokenizer}`, pointing at the root-level `tokenizer` block) and
@@ -219,9 +260,11 @@ def _load_g05_config_from_run_dir(run_dir: Path, ckpt_path: str):
             OmegaConf.to_container(cfg.model.model_arch.AT_CONFIG, resolve=True)
         )
 
-    ckpt_stem = Path(ckpt_path).stem
+    import tempfile
+
     cfg.run_dir = str(run_dir)
-    cfg.output_dir = str(Path(run_dir) / f"eval_{ckpt_stem}")
+    # Never inside run_dir: it may be a read-only HF cache snapshot.
+    cfg.output_dir = str(Path(tempfile.gettempdir()) / "rc_serve_policy" / f"eval_{Path(run_dir).name}")
     cfg.exp_name = Path(run_dir).name
     cfg.logger.task = "eval"
     cfg.logger.experiment_name = f"eval_{Path(run_dir).name}"
@@ -229,18 +272,10 @@ def _load_g05_config_from_run_dir(run_dir: Path, ckpt_path: str):
     cfg.ckpt_path = str(Path(ckpt_path).resolve())
 
     _apply_hf_processor_sidecar(cfg, run_dir)
-    # --- fix (not in upstream `load_config_from_run_dir`): see docstring above. ---
-    # `_apply_hf_processor_sidecar` only redirects `hf_processor_path` to `run_dir/hf_processor`
-    # when `pretrained_model_path` is set (its non-null value is what it falls back to when no
-    # local sidecar exists); when `pretrained_model_path` is already None -- our case -- it
-    # leaves `hf_processor_path` untouched at its original, cwd-relative training-time value
-    # (e.g. "checkpoints/qwen3_5_2b_base_processor"), which doesn't exist here. If a local
-    # `run_dir/hf_processor` sidecar exists (see EVAL_LOCAL_ROBOCOLOSSEUM.md section 8 -- a
-    # symlink to the shared `qwen3_5_2b_base_processor/` from `OpenGalaxea/G05` on HF), point
-    # `hf_processor_path` at it directly.
-    local_hf = Path(run_dir) / "hf_processor"
-    if local_hf.exists():
-        cfg.model.model_arch.hf_processor_path = str(local_hf)
+    # --- fix (not in upstream `load_config_from_run_dir`) ---
+    # `_apply_hf_processor_sidecar` is a no-op when `pretrained_model_path` is null (ours),
+    # leaving the cwd-relative training-time `hf_processor_path`, which doesn't exist here.
+    cfg.model.model_arch.hf_processor_path = str(hf_processor)
     _apply_action_tokenizer_sidecar(cfg, run_dir)
 
     _register_hydra_builtin_resolvers()
@@ -253,15 +288,13 @@ def load_g05(ckpt_path: str, device: str) -> PolicyBackend:
     """Mirrors `scripts/serve_policy.py::setup()` (config resolved from the checkpoint's own
     run dir via Hydra's saved `.hydra/config.yaml`) but skips its websocket/msgpack transport
     -- this script's `serve()` is the transport, this loader only builds the in-process
-    `PolicyInferencer`. `ckpt_path` must therefore point at a checkpoint that still has its
-    training run's `.hydra/config.yaml` findable by walking up to 5 parent dirs (see
-    `find_run_dir`) -- e.g. `<run_dir>/checkpoints/step_8520.pt`, with `<run_dir>/.hydra/`
-    and `<run_dir>/{dataset_stats.json,action_tokenizer.pt}` alongside it. The
-    `configs/data/yam_dustpan.yaml`/`configs/task/yam_dustpan.yaml` dropped in from
-    `serving/g05/` are what that saved config's Hydra `defaults:` resolve against at compose
-    time, not read directly here.
+    `PolicyInferencer`. `ckpt_path` is the checkpoint folder (the training run dir layout):
+    `model.pt`, `.hydra/config.yaml` (the fully composed training config), `dataset_stats.json`
+    and `action_tokenizer.pt` side by side. The Qwen3.5 processor is shared across all G0.5
+    checkpoints and comes from `OpenGalaxea/G05` on HF unless the folder has its own
+    `hf_processor/`.
 
-    Confirmed keys (section 7 of the guide, verified against `configs/data/yam_dustpan.yaml`):
+    Confirmed keys (verified against the checkpoint's `data_yam_dustpan.yaml`):
     state/action parts are `left_arm`(6)/`left_gripper`(1)/`right_arm`(6)/`right_gripper`(1);
     images are `head_rgb`(top, native 360x640 CHW)/`left_wrist_rgb`/`right_wrist_rgb`(both
     480x640 CHW) -- all resized to 224x224 internally by the processor. Arm actions are
@@ -285,8 +318,17 @@ def load_g05(ckpt_path: str, device: str) -> PolicyBackend:
 
     register_default_resolvers()
 
-    ckpt_path = str(Path(ckpt_path).resolve())  # before the chdir below, so it stays correct
+    # `.absolute()`, not `.resolve()`: in an HF cache snapshot every file is a symlink into the
+    # blob store, so resolving would lose the sibling `.hydra/` that `find_run_dir` looks for.
+    # Must happen before the chdir below.
+    ckpt = Path(ckpt_path).absolute()
+    if ckpt.is_dir():
+        ckpt = ckpt / "model.pt"
+    ckpt_path = str(ckpt)
     run_dir = find_run_dir(ckpt_path)
+    hf_processor = run_dir / "hf_processor"
+    if not hf_processor.exists():
+        hf_processor = _hf_snapshot("OpenGalaxea/G05", "qwen3_5_2b_base_processor")
 
     # The saved config's `oc.load:configs/data/parts_meta/r1lite.yaml`-style resolvers use
     # paths relative to the GalaxeaVLA repo root (they assume its own scripts are run with
@@ -297,7 +339,7 @@ def load_g05(ckpt_path: str, device: str) -> PolicyBackend:
     prev_cwd = os.getcwd()
     os.chdir(repo_dir)
     try:
-        cfg = _load_g05_config_from_run_dir(run_dir, ckpt_path)
+        cfg = _load_g05_config_from_run_dir(run_dir, ckpt_path, hf_processor)
 
         model = load_model_from_checkpoint(
             cfg.model.model_arch, cfg.ckpt_path, device=device, extra_prefixes=["normalizer."], eval_mode=False
@@ -411,14 +453,15 @@ _MOLMOACT2_NORM_TAG = "yam_dustpan"
 _MOLMOACT2_DEFAULT_NUM_STEPS = 10
 
 
-def _patch_molmoact2_modeling_for_bf16(local_dir: str) -> None:
-    """Copied from `examples/yam/host_server_yam.py::_patch_modeling_for_bf16` -- two small,
-    idempotent source patches to the checkpoint's own exported `modeling_molmoact2.py` so bf16
-    inference works (upstream `predict_action` hardcodes `dtype=torch.float32` for a generator
-    tensor, and casts actions back to numpy via a bf16-unsafe path). Safe to call on every
-    load: each patch checks its own marker and no-ops if already applied."""
-    import os
+def _molmoact2_bf16_overlay(ckpt_dir: Path) -> Path:
+    """Source patches from `examples/yam/host_server_yam.py::_patch_modeling_for_bf16`, applied
+    to the checkpoint's exported `modeling_molmoact2.py` so bf16 inference works (upstream
+    `predict_action` hardcodes `dtype=torch.float32` for a generator tensor, and casts actions
+    back to numpy via a bf16-unsafe path).
 
+    The checkpoint dir is never modified (an HF cache snapshot's files are symlinks into shared
+    blobs). Instead this returns an overlay dir under `~/.cache/rc_serve_policy/` that symlinks
+    every checkpoint file except a patched copy of `modeling_molmoact2.py`."""
     patches = [
         (
             "device=device,\n            dtype=torch.float32,\n            generator=generator,",
@@ -433,29 +476,37 @@ def _patch_molmoact2_modeling_for_bf16(local_dir: str) -> None:
             "patched_bf16_to_array",
         ),
     ]
-    path = os.path.join(local_dir, "modeling_molmoact2.py")
-    try:
-        with open(path, encoding="utf-8") as f:
-            src = f.read()
-    except OSError:
-        return
+    modeling = ckpt_dir / "modeling_molmoact2.py"
+    src = modeling.read_text(encoding="utf-8")
     new_src = src
     for needle, replacement, marker in patches:
         if marker in new_src or needle not in new_src:
             continue
         new_src = new_src.replace(needle, replacement, 1)
-    if new_src != src:
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(new_src)
+    if new_src == src:
+        return ckpt_dir
+
+    key = hashlib.sha1(f"{ckpt_dir}\n{new_src}".encode()).hexdigest()[:16]
+    overlay = Path.home() / ".cache" / "rc_serve_policy" / "molmoact2" / key
+    overlay.mkdir(parents=True, exist_ok=True)
+    for entry in ckpt_dir.iterdir():
+        link = overlay / entry.name
+        if entry.name == modeling.name or link.is_symlink() or link.exists():
+            continue
+        link.symlink_to(entry.absolute())
+    (overlay / modeling.name).write_text(new_src, encoding="utf-8")
+    return overlay
 
 
-def load_molmoact2(ckpt_path: str, device: str) -> PolicyBackend:
+def load_molmoact2(ckpt_path: str, device: str, norm_tag: str | None = None) -> PolicyBackend:
     """Mirrors `examples/yam/host_server_yam.py::Policy` (that example is already almost
-    exactly this script's contract: 14-D joint state/action, `top`/`left`/`right` cameras) but
-    loads straight from our local converted checkpoint (`ckpt_path`) instead of
-    `snapshot_download`-ing `allenai/MolmoAct2-BimanualYAM`. Norm tag for this fine-tune is
-    `yam_dustpan` (confirmed present as the sole tag in the checkpoint's own `norm_stats.json`
-    after conversion -- see EVAL_LOCAL_ROBOCOLOSSEUM.md section 8)."""
+    exactly this script's contract: 14-D joint state/action, `top`/`left`/`right` cameras).
+
+    `ckpt_path` is a resolved local dir (see `resolve_ckpt`): our Dustpan fine-tune (norm tag
+    `yam_dustpan`, the default) or the official `allenai/MolmoAct2-BimanualYAM` (norm tag
+    `yam_dual_molmoact2`, general YAM data, not Dustpan-specific). `predict_action` reads
+    `norm_stats.json` relative to `config._name_or_path`, so loading by bare repo id would crash
+    at inference time -- hence always a local dir."""
     repo_dir = THIRD_PARTY / "molmoact2"
     _require_submodule(repo_dir)
     _add_to_path(repo_dir)
@@ -464,7 +515,7 @@ def load_molmoact2(ckpt_path: str, device: str) -> PolicyBackend:
     from PIL import Image
     from transformers import AutoModelForImageTextToText, AutoProcessor
 
-    _patch_molmoact2_modeling_for_bf16(ckpt_path)
+    ckpt_path = str(_molmoact2_bf16_overlay(Path(ckpt_path)))
 
     processor = AutoProcessor.from_pretrained(ckpt_path, trust_remote_code=True, extra_special_tokens={})
     model = (
@@ -503,7 +554,7 @@ def load_molmoact2(ckpt_path: str, device: str) -> PolicyBackend:
             images=pil_images,
             task=instruction,
             state=state.astype(np.float32),
-            norm_tag=_MOLMOACT2_NORM_TAG,
+            norm_tag=norm_tag or _MOLMOACT2_NORM_TAG,
             inference_action_mode="continuous",
             enable_depth_reasoning=False,
             num_steps=num_steps or _MOLMOACT2_DEFAULT_NUM_STEPS,
@@ -527,34 +578,33 @@ def load_molmoact2(ckpt_path: str, device: str) -> PolicyBackend:
 
 
 def load_pi05(ckpt_path: str, device: str) -> PolicyBackend:
-    """Requires the `pi05_yam_dustpan` TrainConfig entry described in
-    EVAL_LOCAL_ROBOCOLOSSEUM.md section 0 to already be present in this submodule's
-    `src/openpi/training/config.py` (pull it from the HF `serving/` upload, or add it locally
-    following the `pi05_droid`/`pi05_aloha` entries in that file).
+    """The checkpoint folder ships `train_config.py` (the exact `TrainConfig` it was trained
+    with, exposed as `CONFIG`), loaded straight from the folder -- openpi itself is unmodified.
 
-    Confirmed (section 7): the config's `RepackTransform` runs FIRST and expects
-    LeRobot-style external keys (`observation.images.top/left/right`, `observation.state`,
-    `prompt`), converting them internally to the Aloha-style `cam_high`/`cam_left_wrist`/
-    `cam_right_wrist` dict that `AlohaInputs` then consumes -- so this loader must send the
-    external (left-hand-side) keys below, NOT the internal `cam_*` names. `adapt_to_pi=False`
-    in the config, so no Aloha-space unit conversion is applied -- raw follower joint units
-    are sent as-is."""
+    The config's `RepackTransform` (LeRobot keys -> `cam_*`) only runs in training, so this
+    loader sends the Aloha-style `cam_high`/`cam_left_wrist`/`cam_right_wrist` dict
+    `AlohaInputs` consumes. `adapt_to_pi=False`, so raw follower joint units are sent as-is."""
     repo_dir = THIRD_PARTY / "openpi"
     _require_submodule(repo_dir)
     _add_to_path(repo_dir / "src")
 
     from openpi.policies import policy_config
-    from openpi.training import config as openpi_config
 
-    train_config = openpi_config.get_config("pi05_yam_dustpan")
-    policy = policy_config.create_trained_policy(train_config, ckpt_path, pytorch_device=device)
+    spec = importlib.util.spec_from_file_location("rc_pi05_train_config", Path(ckpt_path) / "train_config.py")
+    train_config_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(train_config_module)
+    policy = policy_config.create_trained_policy(train_config_module.CONFIG, ckpt_path, pytorch_device=device)
 
     def infer(images, instruction, state, num_steps):
+        # `create_trained_policy` doesn't apply the config's (training-only) repack transform, so
+        # send its output keys directly; `AlohaInputs` wants CHW images.
         obs = {
-            "observation.images.top": images["top"],
-            "observation.images.left": images["left"],
-            "observation.images.right": images["right"],
-            "observation.state": state.astype(np.float32),
+            "images": {
+                "cam_high": np.ascontiguousarray(images["top"].transpose(2, 0, 1)),
+                "cam_left_wrist": np.ascontiguousarray(images["left"].transpose(2, 0, 1)),
+                "cam_right_wrist": np.ascontiguousarray(images["right"].transpose(2, 0, 1)),
+            },
+            "state": state.astype(np.float32),
             "prompt": instruction,
         }
         result = policy.infer(obs)
@@ -570,55 +620,110 @@ def load_pi05(ckpt_path: str, device: str) -> PolicyBackend:
 # ---------------------------------------------------------------------------
 
 
+_LINGBOT_BASE = "robbyant/lingbot-vla-v2-6b"
+_LINGBOT_QWEN = "Qwen/Qwen3-VL-4B-Instruct"
+_LINGBOT_MOGE = "Ruicheng/moge-2-vitb-normal"
+
+
+def _lingbot_cli_overlay(ckpt_dir: Path) -> Path:
+    """Upstream `LingbotVLAv2Server.load_vla` reads the training CLI config from
+    `<ckpt>/../../../lingbotvla_cli.yaml`, and the checkpoint's copy hardcodes training-machine
+    paths for the base model, Qwen3-VL and the depth/video alignment modules. Writes
+    `<overlay>/lingbotvla_cli.yaml` with those paths pointed at HF cache snapshots, links
+    `<overlay>/_/_/ckpt -> ckpt_dir`, and returns that `ckpt` path for `path_to_pi_model`.
+    Only config/tokenizer/aux files are fetched from the base repos -- the fine-tuned weights
+    all come from `ckpt_dir`."""
+    import yaml
+
+    base = _hf_repo_files(_LINGBOT_BASE, ["*.json", "depth/*", "dino_video/*"])
+    qwen = _hf_repo_files(_LINGBOT_QWEN, ["*.json", "*.txt", "*.jinja"])
+    moge = _hf_repo_files(_LINGBOT_MOGE, ["*.json", "*.pt"])
+
+    cli = yaml.safe_load((ckpt_dir / "lingbotvla_cli.yaml").read_text())
+    cli["model"]["model_path"] = str(base)
+    cli["model"]["config_path"] = str(base)
+    cli["model"]["tokenizer_path"] = str(qwen)
+    align = cli["train"]["align_params"]
+    align["depth"]["moge_path"] = str(moge / "model.pt")
+    align["depth"]["morgbd_path"] = str(base / "depth" / "model.pt")
+    align["video"]["ckpt_path"] = str(base / "dino_video" / "teacher_step_10000.pth")
+    align["video"]["config_path"] = str(base / "dino_video" / "config.yaml")
+    rendered = yaml.safe_dump(cli, sort_keys=False)
+
+    key = hashlib.sha1(f"{ckpt_dir}\n{rendered}".encode()).hexdigest()[:16]
+    overlay = Path.home() / ".cache" / "rc_serve_policy" / "lingbot" / key
+    link = overlay / "_" / "_" / "ckpt"
+    link.parent.mkdir(parents=True, exist_ok=True)
+    if not link.is_symlink():
+        link.symlink_to(ckpt_dir.absolute(), target_is_directory=True)
+    (overlay / "lingbotvla_cli.yaml").write_text(rendered)
+    return link
+
+
 def load_lingbot(ckpt_path: str, device: str) -> PolicyBackend:
     """Wraps `deploy.lingbot_vla_v2_policy.LingbotVLAv2Server` in-process (skipping its own
-    websocket+msgpack `serve_forever()`), then calls `.reset(robo_name="yam_dustpan")` once to
-    load the YAM robot config/norm stats from `configs/robot_configs/yam_dustpan.yaml` +
-    `assets/norm_stats/yam_dustpan.json` before serving (confirmed present in section 7).
+    websocket+msgpack `serve_forever()`). Everything comes from the checkpoint folder:
+    `lingbotvla_cli.yaml` (training config, paths rewritten by `_lingbot_cli_overlay`),
+    `robot_config_yam_dustpan.yaml` (14-D -> 55-D mapping) and `norm_stats.json`.
 
-    Confirmed image keys: `observation.images.camera_top` / `camera_wrist_left` /
-    `camera_wrist_right`, sourced from `top`/`left`/`right` respectively. Arm actions use
-    `subtract_state: True, relative_type: joint` (relative to current state, same pattern as
-    GR00T/G0.5) while the gripper action is absolute -- `server.infer`'s own `feature_transform
-    .unapply` handles the un-relativize step, so this loader passes the raw model output
-    through unchanged."""
+    Upstream `reset()` reads the robot config from a cwd-relative `configs/robot_configs/`
+    (inside the submodule), so this loader does the same setup with the checkpoint's own file.
+    `FeatureTransform` takes the raw dataset keys (`observation.state`,
+    `observation.images.{top,left,right}`, `task`) and its `unapply` turns the relative arm
+    actions back into absolute joints, so the output is passed through unchanged."""
     repo_dir = THIRD_PARTY / "lingbot-vla-v2"
     _require_submodule(repo_dir)
     _add_to_path(repo_dir)
 
+    import torch
+    import yaml
     from deploy.lingbot_vla_v2_policy import LingbotVLAv2Server
+    from lingbotvla.data.vla_data.utils import FeatureTransform
 
-    server = LingbotVLAv2Server(path_to_pi_model=ckpt_path, use_bf16=True)
-    server.reset(robo_name="yam_dustpan")
+    ckpt_dir = Path(ckpt_path)
+    server = LingbotVLAv2Server(
+        path_to_pi_model=str(_lingbot_cli_overlay(ckpt_dir)),
+        robot_norm_path=str(ckpt_dir / "norm_stats.json"),
+        chunk_ret=True,
+        use_length=-1,
+        use_bf16=True,
+    )
+
+    robot_config = str(ckpt_dir / "robot_config_yam_dustpan.yaml")
+    server.robot_config = yaml.safe_load(Path(robot_config).read_text())
+    feature_transform = FeatureTransform(
+        robot_config,
+        server.data_config,
+        server.config,
+        server.processor,
+        chunk_size=server.config.chunk_size,
+        norm_stats_path=server.robot_norm_path,
+    )
+    server.vla.feature_transform = feature_transform
+    server.action_key = feature_transform.org_features["actions"]
 
     def infer(images, instruction, state, num_steps):
-        left_q, left_g = state[0:6], state[6]
-        right_q, right_g = state[7:13], state[13]
         observation = {
-            "images": {
-                "observation.images.camera_top": images["top"],
-                "observation.images.camera_wrist_left": images["left"],
-                "observation.images.camera_wrist_right": images["right"],
-            },
-            "state": {
-                "left_arm": left_q.astype(np.float32),
-                "left_gripper": float(left_g),
-                "right_arm": right_q.astype(np.float32),
-                "right_gripper": float(right_g),
-            },
-            "instruction": instruction,
+            "observation.images.top": images["top"],
+            "observation.images.left": images["left"],
+            "observation.images.right": images["right"],
+            "observation.state": torch.from_numpy(state.astype(np.float32)),
+            "task": instruction,
         }
         out = server.infer(observation)
-        chunk = out["left_arm"].shape[0]
-        actions = np.zeros((chunk, ACTION_DIM), dtype=np.float32)
-        actions[:, 0:6] = out["left_arm"]
-        actions[:, 6] = np.asarray(out["left_gripper"]).reshape(-1)
-        actions[:, 7:13] = out["right_arm"]
-        actions[:, 13] = np.asarray(out["right_gripper"]).reshape(-1)
-        return actions
+        return np.asarray(out["action"], dtype=np.float32)
 
     return infer
 
+
+DEFAULT_HF_REPO = "RoboColosseum/BimanualYAM-models"
+HF_MODEL_FOLDERS = {
+    "gr00t": "gr00t",
+    "g05": "g05",
+    "molmoact2": "molmoact2",
+    "pi05": "pi05",
+    "lingbot": "lingbot-vla-v2",
+}
 
 _BACKENDS = {
     "gr00t": load_gr00t,
@@ -629,7 +734,9 @@ _BACKENDS = {
 }
 
 
-def serve(policy_name: str, ckpt_path: str, host: str, port: int, device: str) -> None:
+def serve(
+    policy_name: str, ckpt_path: str, host: str, port: int, device: str, norm_tag: str | None = None
+) -> None:
     # Imported here, not at module top, so `--help` never needs Flask/json_numpy installed
     # and so json_numpy's process-wide monkeypatch of the stdlib `json` module (needed for
     # ndarray-in-JSON) happens only once the backend's own heavy imports (which may do their
@@ -638,9 +745,17 @@ def serve(policy_name: str, ckpt_path: str, host: str, port: int, device: str) -
     import json_numpy
     from flask import Flask, jsonify, request
 
+    print(f"[rc_serve_policy] resolving {ckpt_path!r} ...")
+    ckpt_path = str(resolve_ckpt(ckpt_path))
     print(f"[rc_serve_policy] loading {policy_name!r} from {ckpt_path!r} on {device!r} ...")
     t0 = time.perf_counter()
-    infer = _BACKENDS[policy_name](ckpt_path, device)
+    # `norm_tag` only means something to molmoact2 (its checkpoint can hold multiple norm
+    # tags -- ours vs. the officially released BimanualYAM one); every other backend picks its
+    # norm stats up from its own config/run dir and has no equivalent override.
+    if policy_name == "molmoact2":
+        infer = load_molmoact2(ckpt_path, device, norm_tag=norm_tag)
+    else:
+        infer = _BACKENDS[policy_name](ckpt_path, device)
     print(f"[rc_serve_policy] loaded in {time.perf_counter() - t0:.1f}s")
 
     json_numpy.patch()
@@ -678,12 +793,32 @@ def serve(policy_name: str, ckpt_path: str, host: str, port: int, device: str) -
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--policy", required=True, choices=sorted(_BACKENDS), help="Which VLA fine-tune to serve.")
-    parser.add_argument("--ckpt_path", required=True, help="Path to that model's downloaded checkpoint (see hf download in section 2 of the guide).")
+    parser.add_argument("--hf_repo", default=DEFAULT_HF_REPO, help="HF repo laid out as <model>/<task>/.")
+    parser.add_argument("--task", help="Task folder inside --hf_repo, e.g. 'dustpan'.")
+    parser.add_argument(
+        "--ckpt_path",
+        help="Override: local dir or hf://<org>/<repo>[/<subfolder>][@<rev>]. Takes precedence over --hf_repo/--task.",
+    )
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument(
+        "--norm_tag",
+        default=None,
+        help=(
+            "molmoact2 only: override the checkpoint's norm tag (default 'yam_dustpan' for "
+            "our fine-tune; pass 'yam_dual_molmoact2' when --ckpt_path points at a local "
+            "snapshot of the official allenai/MolmoAct2-BimanualYAM checkpoint instead)."
+        ),
+    )
     args = parser.parse_args()
-    serve(args.policy, args.ckpt_path, args.host, args.port, args.device)
+    if args.ckpt_path:
+        ckpt_ref = args.ckpt_path
+    elif args.task:
+        ckpt_ref = f"hf://{args.hf_repo}/{HF_MODEL_FOLDERS[args.policy]}/{args.task}"
+    else:
+        parser.error("pass --task (checkpoint from --hf_repo) or --ckpt_path")
+    serve(args.policy, ckpt_ref, args.host, args.port, args.device, norm_tag=args.norm_tag)
 
 
 if __name__ == "__main__":
