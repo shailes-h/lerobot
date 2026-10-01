@@ -935,7 +935,14 @@ class LeRobotDataset(torch.utils.data.Dataset):
         # Check if all required video files exist
         if len(self.meta.video_keys) > 0:
             for ep_idx in requested_episodes:
+                ep = self.meta.episodes[ep_idx] if self.meta.episodes is not None else None
                 for vid_key in self.meta.video_keys:
+                    chunk_idx = ep.get(f"videos/{vid_key}/chunk_index") if ep is not None else None
+                    if chunk_idx is None:
+                        # Episode hasn't been encoded yet (e.g. skip_video_encoding, or a
+                        # batch-encoding crash before the batch threshold was reached) - there's
+                        # nothing to fetch from the hub for it, so don't treat this as missing cache.
+                        continue
                     video_path = self.root / self.meta.get_video_file_path(ep_idx, vid_key)
                     if not video_path.exists():
                         return False

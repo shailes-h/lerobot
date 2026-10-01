@@ -69,7 +69,11 @@ def _load_episode_with_stats(src_dataset: LeRobotDataset, episode_idx: int) -> d
     file_idx = ep_meta["meta/episodes/file_index"]
 
     parquet_path = src_dataset.root / DEFAULT_EPISODES_PATH.format(chunk_index=chunk_idx, file_index=file_idx)
-    df = pd.read_parquet(parquet_path)
+    # pd.read_parquet() chokes on this project's nested-list per-channel image/depth stat
+    # columns (TypeError: data type '...[pyarrow]' not understood) because pandas tries to
+    # honor the embedded pandas schema metadata and map those columns to ArrowDtype. Read via
+    # pyarrow directly and drop that metadata first so columns come back as plain object arrays.
+    df = pq.read_table(parquet_path).replace_schema_metadata(None).to_pandas()
 
     episode_row = df[df["episode_index"] == episode_idx].iloc[0]
 
